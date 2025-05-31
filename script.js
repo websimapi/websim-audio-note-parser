@@ -1,4 +1,6 @@
 // Global variables
+import Essentia from 'essentia.js';
+
 let audioContext;
 let analyser;
 let mediaStream;
@@ -20,6 +22,15 @@ let detectedLayers = new Map(); // Track different instrument layers
 let layerClassifier = null;
 let customLayerNames = new Map(); // Store custom layer names
 
+// Essentia.js variables
+let essentia = null;
+let pitchDetector = null;
+let onsetDetector = null;
+let spectralFeatures = null;
+let audioBuffer = [];
+let frameSize = 2048;
+let hopSize = 512;
+
 const toggleRecordingButton = document.getElementById('toggleRecording');
 const downloadMidiButton = document.getElementById('downloadMidi');
 const downloadMp3Button = document.getElementById('downloadMp3');
@@ -35,12 +46,16 @@ const sensitivitySlider = document.getElementById('sensitivitySlider');
 const peakThresholdSlider = document.getElementById('peakThresholdSlider');
 const noteDurationSlider = document.getElementById('noteDurationSlider');
 const harmonicThresholdSlider = document.getElementById('harmonicThresholdSlider');
+const onsetThresholdSlider = document.getElementById('onsetThresholdSlider');
+const pitchConfidenceSlider = document.getElementById('pitchConfidenceSlider');
 
 // Dynamic detection parameters
 let MIN_AMPLITUDE_THRESHOLD = 20;
 let PEAK_THRESHOLD = 30;
 let NOTE_DURATION_THRESHOLD = 100;
 let HARMONIC_THRESHOLD = 0.3;
+let ONSET_THRESHOLD = 0.5;
+let PITCH_CONFIDENCE_THRESHOLD = 0.7;
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const A4_FREQUENCY = 440;
@@ -82,6 +97,16 @@ harmonicThresholdSlider.addEventListener('input', (e) => {
     document.getElementById('harmonicThresholdValue').textContent = e.target.value;
 });
 
+onsetThresholdSlider.addEventListener('input', (e) => {
+    ONSET_THRESHOLD = parseFloat(e.target.value);
+    document.getElementById('onsetThresholdValue').textContent = e.target.value;
+});
+
+pitchConfidenceSlider.addEventListener('input', (e) => {
+    PITCH_CONFIDENCE_THRESHOLD = parseFloat(e.target.value);
+    document.getElementById('pitchConfidenceValue').textContent = e.target.value;
+});
+
 downloadMidiButton.addEventListener('click', downloadMidiFile);
 downloadMp3Button.addEventListener('click', downloadMp3File);
 playbackButton.addEventListener('click', playRecording);
@@ -92,6 +117,14 @@ async function startRecording() {
     if (isRecording) return;
 
     try {
+        statusDisplay.textContent = 'Status: Initializing Essentia...';
+        
+        // Initialize Essentia.js
+        if (!essentia) {
+            essentia = new Essentia();
+            await essentia.initialize();
+        }
+
         statusDisplay.textContent = 'Status: Requesting permissions...';
         mediaStream = await navigator.mediaDevices.getDisplayMedia({
             video: true, 
@@ -111,12 +144,15 @@ async function startRecording() {
         analyser = audioContext.createAnalyser();
 
         analyser.fftSize = 16384; // Increased for better frequency resolution
-        analyser.smoothingTimeConstant = 0.3; // Add smoothing
+        analyser.smoothingTimeConstant = 0.1; // Reduced for more responsive detection
         const bufferLength = analyser.frequencyBinCount;
         dataArray = new Float32Array(analyser.fftSize);
         frequencyData = new Uint8Array(bufferLength);
 
         sourceNode.connect(analyser);
+
+        // Initialize audio buffer for Essentia processing
+        audioBuffer = [];
 
         isRecording = true;
         recordedNotes = [];
@@ -170,7 +206,9 @@ function stopRecording() {
                 duration: noteDuration,
                 startTime: noteData.startTime - recordingStartTime,
                 layer: layer.id,
-                layerName: layer.name
+                layerName: layer.name,
+                confidence: noteData.noteInfo.confidence || 1,
+                hasOnset: noteData.hasOnset || false
             };
             recordedNotes.push(recordedNote);
             updateLayerTracking(layer.id, recordedNote);
@@ -233,12 +271,22 @@ function stopMediaStream() {
 }
 
 function analyzeAudio() {
-    if (!isRecording || !analyser || !audioContext || !dataArray) return;
+    if (!isRecording || !analyser || !audioContext || !dataArray || !essentia) return;
 
     animationFrameId = requestAnimationFrame(analyzeAudio);
 
-    // Get frequency domain data for polyphonic detection
+    // Get time domain data for Essentia processing
+    analyser.getFloatTimeDomainData(dataArray);
     analyser.getByteFrequencyData(frequencyData);
+    
+    // Add current frame to buffer
+    const currentFrame = new Float32Array(dataArray);
+    audioBuffer.push(currentFrame);
+    
+    // Keep buffer manageable (last 10 frames for onset detection)
+    if (audioBuffer.length > 10) {
+        audioBuffer.shift();
+    }
     
     // Check if there's sufficient signal
     const maxAmplitude = Math.max(...frequencyData);
@@ -249,30 +297,87 @@ function analyzeAudio() {
         return;
     }
 
-    // Detect multiple frequencies using FFT peak detection
-    const detectedFrequencies = detectMultipleFrequencies(frequencyData, audioContext.sampleRate);
-    
-    if (detectedFrequencies.length > 0) {
-        const freqDisplay = detectedFrequencies.map(f => f.toFixed(1)).join(', ');
-        frequencyDisplay.textContent = freqDisplay;
+    try {
+        // Use Essentia for advanced analysis
+        const analysisResults = performEssentiaAnalysis(currentFrame);
         
-        const noteInfos = detectedFrequencies.map(freq => {
-            const noteInfo = frequencyToNoteAndOctave(freq);
-            return {
-                ...noteInfo,
-                frequency: freq,
-                midiNote: noteToMidi(noteInfo.name, noteInfo.octave)
-            };
-        }).filter(note => note.name);
+        if (analysisResults.detectedFrequencies.length > 0) {
+            const freqDisplay = analysisResults.detectedFrequencies.map(f => f.toFixed(1)).join(', ');
+            frequencyDisplay.textContent = freqDisplay;
+            
+            const noteInfos = analysisResults.detectedFrequencies.map(freq => {
+                const noteInfo = frequencyToNoteAndOctave(freq);
+                return {
+                    ...noteInfo,
+                    frequency: freq,
+                    midiNote: noteToMidi(noteInfo.name, noteInfo.octave),
+                    confidence: analysisResults.confidence || 1,
+                    onset: analysisResults.hasOnset || false
+                };
+            }).filter(note => note.name && note.confidence >= PITCH_CONFIDENCE_THRESHOLD);
+            
+            const noteDisplayText = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
+            document.getElementById('noteDisplay').textContent = noteDisplayText || '-';
+            
+            handleNotesChange(noteInfos, analysisResults.hasOnset);
+        } else {
+            // Fallback to original detection method
+            const detectedFrequencies = detectMultipleFrequencies(frequencyData, audioContext.sampleRate);
+            
+            if (detectedFrequencies.length > 0) {
+                const freqDisplay = detectedFrequencies.map(f => f.toFixed(1)).join(', ');
+                frequencyDisplay.textContent = freqDisplay;
+                
+                const noteInfos = detectedFrequencies.map(freq => {
+                    const noteInfo = frequencyToNoteAndOctave(freq);
+                    return {
+                        ...noteInfo,
+                        frequency: freq,
+                        midiNote: noteToMidi(noteInfo.name, noteInfo.octave),
+                        confidence: 0.8,
+                        onset: false
+                    };
+                }).filter(note => note.name);
+                
+                const noteDisplayText = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
+                document.getElementById('noteDisplay').textContent = noteDisplayText || '-';
+                
+                handleNotesChange(noteInfos, false);
+            } else {
+                handleNotesChange([]);
+                frequencyDisplay.textContent = '-';
+                noteDisplay.textContent = '-';
+            }
+        }
+    } catch (error) {
+        console.warn('Essentia analysis failed, using fallback:', error);
+        // Fallback to original method
+        const detectedFrequencies = detectMultipleFrequencies(frequencyData, audioContext.sampleRate);
         
-        const noteDisplayText = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
-        document.getElementById('noteDisplay').textContent = noteDisplayText || '-';
-        
-        handleNotesChange(noteInfos);
-    } else {
-        handleNotesChange([]);
-        frequencyDisplay.textContent = '-';
-        noteDisplay.textContent = '-';
+        if (detectedFrequencies.length > 0) {
+            const freqDisplay = detectedFrequencies.map(f => f.toFixed(1)).join(', ');
+            frequencyDisplay.textContent = freqDisplay;
+            
+            const noteInfos = detectedFrequencies.map(freq => {
+                const noteInfo = frequencyToNoteAndOctave(freq);
+                return {
+                    ...noteInfo,
+                    frequency: freq,
+                    midiNote: noteToMidi(noteInfo.name, noteInfo.octave),
+                    confidence: 0.8,
+                    onset: false
+                };
+            }).filter(note => note.name);
+            
+            const noteDisplayText = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
+            document.getElementById('noteDisplay').textContent = noteDisplayText || '-';
+            
+            handleNotesChange(noteInfos, false);
+        } else {
+            handleNotesChange([]);
+            frequencyDisplay.textContent = '-';
+            noteDisplay.textContent = '-';
+        }
     }
 }
 
@@ -336,7 +441,95 @@ function detectMultipleFrequencies(frequencyData, sampleRate) {
     return fundamentals.map(peak => peak.frequency);
 }
 
-function handleNotesChange(currentNotes) {
+function performEssentiaAnalysis(audioFrame) {
+    try {
+        const results = {
+            detectedFrequencies: [],
+            confidence: 0,
+            hasOnset: false,
+            spectralFeatures: {}
+        };
+
+        // Pitch detection using Essentia
+        const pitchResult = essentia.PitchYin(audioFrame, 80, 2000, 0.1);
+        if (pitchResult.pitch > 80 && pitchResult.pitchConfidence >= PITCH_CONFIDENCE_THRESHOLD) {
+            results.detectedFrequencies.push(pitchResult.pitch);
+            results.confidence = pitchResult.pitchConfidence;
+        }
+
+        // Polyphonic pitch detection using spectral peaks
+        const spectrum = essentia.Spectrum(audioFrame);
+        const spectralPeaks = essentia.SpectralPeaks(spectrum.spectrum);
+        
+        // Filter and validate spectral peaks
+        const validPeaks = spectralPeaks.frequencies
+            .map((freq, i) => ({ freq, magnitude: spectralPeaks.magnitudes[i] }))
+            .filter(peak => peak.freq >= 80 && peak.freq <= 2000 && peak.magnitude > PEAK_THRESHOLD)
+            .sort((a, b) => b.magnitude - a.magnitude)
+            .slice(0, 6); // Top 6 peaks
+
+        // Add prominent peaks as additional frequencies
+        validPeaks.forEach(peak => {
+            if (!results.detectedFrequencies.some(f => Math.abs(f - peak.freq) < 5)) {
+                results.detectedFrequencies.push(peak.freq);
+            }
+        });
+
+        // Onset detection
+        if (audioBuffer.length >= 2) {
+            const prevFrame = audioBuffer[audioBuffer.length - 2];
+            const currentFrame = audioBuffer[audioBuffer.length - 1];
+            
+            const prevSpectrum = essentia.Spectrum(prevFrame);
+            const currentSpectrum = essentia.Spectrum(currentFrame);
+            
+            // Simple spectral flux for onset detection
+            let spectralFlux = 0;
+            for (let i = 0; i < Math.min(prevSpectrum.spectrum.length, currentSpectrum.spectrum.length); i++) {
+                const diff = currentSpectrum.spectrum[i] - prevSpectrum.spectrum[i];
+                if (diff > 0) spectralFlux += diff;
+            }
+            
+            results.hasOnset = spectralFlux > ONSET_THRESHOLD;
+        }
+
+        // Harmonic analysis for better fundamental frequency detection
+        if (results.detectedFrequencies.length > 1) {
+            results.detectedFrequencies = filterHarmonics(results.detectedFrequencies);
+        }
+
+        return results;
+    } catch (error) {
+        console.warn('Essentia analysis error:', error);
+        return { detectedFrequencies: [], confidence: 0, hasOnset: false };
+    }
+}
+
+function filterHarmonics(frequencies) {
+    const fundamentals = [];
+    const sortedFreqs = frequencies.sort((a, b) => a - b);
+    
+    for (const freq of sortedFreqs) {
+        let isFundamental = true;
+        
+        // Check if this frequency is a harmonic of existing fundamentals
+        for (const fund of fundamentals) {
+            const ratio = freq / fund;
+            if (Math.abs(ratio - Math.round(ratio)) < 0.1 && ratio >= 1.5) {
+                isFundamental = false;
+                break;
+            }
+        }
+        
+        if (isFundamental) {
+            fundamentals.push(freq);
+        }
+    }
+    
+    return fundamentals.slice(0, 4); // Max 4 simultaneous notes
+}
+
+function handleNotesChange(currentNotes, hasOnset = false) {
     const now = Date.now();
     const currentNoteKeys = new Set(currentNotes.map(note => `${note.name}${note.octave}`));
     const activeNoteKeys = new Set(activeNotes.keys());
@@ -353,7 +546,9 @@ function handleNotesChange(currentNotes) {
                     duration: noteDuration,
                     startTime: noteData.startTime - recordingStartTime,
                     layer: layer.id,
-                    layerName: layer.name
+                    layerName: layer.name,
+                    confidence: noteData.noteInfo.confidence || 1,
+                    hasOnset: noteData.hasOnset || false
                 };
                 recordedNotes.push(recordedNote);
                 updateLayerTracking(layer.id, recordedNote);
@@ -371,7 +566,8 @@ function handleNotesChange(currentNotes) {
         if (!activeNotes.has(noteKey)) {
             activeNotes.set(noteKey, {
                 noteInfo: note,
-                startTime: now
+                startTime: now,
+                hasOnset: hasOnset
             });
         }
     }
@@ -512,7 +708,7 @@ function downloadMidiFile() {
 }
 
 function createMidiFile(notes) {
-    console.log('Processing notes for MIDI with layers:', notes);
+    console.log('Processing notes for MIDI with enhanced timing:', notes);
     
     const ticksPerQuarter = 480;
     
@@ -524,6 +720,15 @@ function createMidiFile(notes) {
             layerGroups[layerId] = [];
         }
         layerGroups[layerId].push(note);
+    });
+    
+    // Sort notes by confidence and onset detection for better timing
+    Object.values(layerGroups).forEach(layer => {
+        layer.sort((a, b) => {
+            if (a.startTime !== b.startTime) return a.startTime - b.startTime;
+            if (a.hasOnset !== b.hasOnset) return b.hasOnset ? 1 : -1;
+            return (b.confidence || 1) - (a.confidence || 1);
+        });
     });
     
     const numTracks = Math.max(1, Object.keys(layerGroups).length);
