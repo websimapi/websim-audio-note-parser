@@ -43,6 +43,7 @@ const noteDurationSlider = document.getElementById('noteDurationSlider');
 const harmonicThresholdSlider = document.getElementById('harmonicThresholdSlider');
 const onsetThresholdSlider = document.getElementById('onsetThresholdSlider');
 const pitchConfidenceSlider = document.getElementById('pitchConfidenceSlider');
+const noteMergeSlider = document.getElementById('noteMergeSlider');
 
 // Dynamic detection parameters
 let MIN_AMPLITUDE_THRESHOLD = 20;
@@ -51,6 +52,7 @@ let NOTE_DURATION_THRESHOLD = 100;
 let HARMONIC_THRESHOLD = 0.3;
 let ONSET_THRESHOLD = 0.5;
 let PITCH_CONFIDENCE_THRESHOLD = 0.7;
+let NOTE_MERGE_GAP_THRESHOLD = 200; // Max gap in ms to merge notes
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const A4_FREQUENCY = 440;
@@ -100,6 +102,11 @@ onsetThresholdSlider.addEventListener('input', (e) => {
 pitchConfidenceSlider.addEventListener('input', (e) => {
     PITCH_CONFIDENCE_THRESHOLD = parseFloat(e.target.value);
     document.getElementById('pitchConfidenceValue').textContent = e.target.value;
+});
+
+noteMergeSlider.addEventListener('input', (e) => {
+    NOTE_MERGE_GAP_THRESHOLD = parseInt(e.target.value);
+    document.getElementById('noteMergeValue').textContent = e.target.value;
 });
 
 downloadMidiButton.addEventListener('click', downloadMidiFile);
@@ -193,16 +200,20 @@ function stopRecording() {
                 ...noteData.noteInfo,
                 duration: noteDuration,
                 startTime: noteData.startTime - recordingStartTime,
+                endTime: Date.now() - recordingStartTime,
                 layer: layer.id,
                 layerName: layer.name,
                 confidence: noteData.noteInfo.confidence || 1,
                 hasOnset: noteData.hasOnset || false
             };
-            recordedNotes.push(recordedNote);
-            updateLayerTracking(layer.id, recordedNote);
-            console.log('Recorded note:', recordedNote);
-            noteCountDisplay.textContent = recordedNotes.length.toString();
-            updateLayerDisplay();
+            const mergedNote = tryMergeWithLastNote(recordedNote);
+            if (!mergedNote) {
+                recordedNotes.push(recordedNote);
+                updateLayerTracking(layer.id, recordedNote);
+                console.log('Recorded note:', recordedNote);
+                noteCountDisplay.textContent = recordedNotes.length.toString();
+                updateLayerDisplay();
+            }
         }
     }
     activeNotes.clear();
@@ -417,7 +428,7 @@ function detectMultipleFrequencies(frequencyData, sampleRate) {
 
 function handleNotesChange(currentNotes, hasOnset = false) {
     const now = Date.now();
-    const currentNoteKeys = new Set(currentNotes.map(note => `${note.name}${note.octave}`));
+    const currentNoteKeys = new Set(currentNotes.map(note => `${note.name}${note.octave}_${classifyIntoLayer(note.frequency).id}`));
     const activeNoteKeys = new Set(activeNotes.keys());
     
     // End notes that are no longer detected
@@ -431,16 +442,22 @@ function handleNotesChange(currentNotes, hasOnset = false) {
                     ...noteData.noteInfo,
                     duration: noteDuration,
                     startTime: noteData.startTime - recordingStartTime,
+                    endTime: now - recordingStartTime,
                     layer: layer.id,
                     layerName: layer.name,
                     confidence: noteData.noteInfo.confidence || 0.8,
                     hasOnset: noteData.hasOnset || false
                 };
-                recordedNotes.push(recordedNote);
-                updateLayerTracking(layer.id, recordedNote);
-                console.log('Recorded note:', recordedNote);
-                noteCountDisplay.textContent = recordedNotes.length.toString();
-                updateLayerDisplay();
+                
+                // Check if this note can be merged with the last recorded note
+                const mergedNote = tryMergeWithLastNote(recordedNote);
+                if (!mergedNote) {
+                    recordedNotes.push(recordedNote);
+                    updateLayerTracking(layer.id, recordedNote);
+                    console.log('Recorded note:', recordedNote);
+                    noteCountDisplay.textContent = recordedNotes.length.toString();
+                    updateLayerDisplay();
+                }
             }
             activeNotes.delete(noteKey);
         }
@@ -448,7 +465,8 @@ function handleNotesChange(currentNotes, hasOnset = false) {
     
     // Start new notes
     for (const note of currentNotes) {
-        const noteKey = `${note.name}${note.octave}`;
+        const layer = classifyIntoLayer(note.frequency);
+        const noteKey = `${note.name}${note.octave}_${layer.id}`;
         if (!activeNotes.has(noteKey)) {
             activeNotes.set(noteKey, {
                 noteInfo: note,
@@ -463,6 +481,49 @@ function handleNotesChange(currentNotes, hasOnset = false) {
             }
         }
     }
+}
+
+function tryMergeWithLastNote(newNote) {
+    if (recordedNotes.length === 0) return false;
+    
+    // Find the most recent note in the same layer with the same pitch
+    for (let i = recordedNotes.length - 1; i >= 0; i--) {
+        const lastNote = recordedNotes[i];
+        
+        // Check if it's the same note and layer
+        if (lastNote.name === newNote.name && 
+            lastNote.octave === newNote.octave && 
+            lastNote.layer === newNote.layer) {
+            
+            // Check if the gap between notes is small enough to merge
+            const lastNoteEnd = lastNote.startTime + lastNote.duration;
+            const gapBetweenNotes = newNote.startTime - lastNoteEnd;
+            
+            if (gapBetweenNotes <= NOTE_MERGE_GAP_THRESHOLD) {
+                // Merge the notes by extending the duration
+                const originalEnd = lastNote.startTime + lastNote.duration;
+                const newEnd = newNote.startTime + newNote.duration;
+                lastNote.duration = Math.max(originalEnd, newEnd) - lastNote.startTime;
+                lastNote.endTime = Math.max(originalEnd, newEnd);
+                
+                // Update confidence to the higher of the two
+                lastNote.confidence = Math.max(lastNote.confidence || 0.8, newNote.confidence || 0.8);
+                
+                // Preserve onset information
+                if (newNote.hasOnset) {
+                    lastNote.hasOnset = true;
+                }
+                
+                console.log('Merged note with previous:', lastNote);
+                return true; // Note was merged
+            }
+            
+            // If we found the same note but gap is too large, don't merge
+            break;
+        }
+    }
+    
+    return false; // Note was not merged
 }
 
 function classifyIntoLayer(frequency) {
