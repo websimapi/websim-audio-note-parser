@@ -29,6 +29,29 @@
         <div id="recordedNotes">
             <p>Recorded Notes: <span id="noteCount">0</span></p>
         </div>
+        <div id="layerManagement" style="display: none;">
+            <h3>Layer Management</h3>
+            <div id="layerList"></div>
+        </div>
+        <div id="detectionControls">
+            <h3>Detection Controls</h3>
+            <div class="slider-group">
+                <label for="sensitivitySlider">Sensitivity: <span id="sensitivityValue">20</span></label>
+                <input type="range" id="sensitivitySlider" min="5" max="50" value="20" step="1">
+            </div>
+            <div class="slider-group">
+                <label for="peakThresholdSlider">Peak Threshold: <span id="peakThresholdValue">30</span></label>
+                <input type="range" id="peakThresholdSlider" min="10" max="80" value="30" step="5">
+            </div>
+            <div class="slider-group">
+                <label for="noteDurationSlider">Min Note Duration (ms): <span id="noteDurationValue">100</span></label>
+                <input type="range" id="noteDurationSlider" min="50" max="500" value="100" step="25">
+            </div>
+            <div class="slider-group">
+                <label for="harmonicThresholdSlider">Harmonic Filter: <span id="harmonicThresholdValue">0.3</span></label>
+                <input type="range" id="harmonicThresholdSlider" min="0.1" max="0.8" value="0.3" step="0.1">
+            </div>
+        </div>
         <div id="status" class="status-idle">Status: Idle</div>
     </div>
     <script src="script.js" type="module"></script>

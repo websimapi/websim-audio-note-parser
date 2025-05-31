@@ -18,6 +18,7 @@ let activeNotes = new Map(); // Track multiple simultaneous notes
 let harmonicAnalyzer = null;
 let detectedLayers = new Map(); // Track different instrument layers
 let layerClassifier = null;
+let customLayerNames = new Map(); // Store custom layer names
 
 const toggleRecordingButton = document.getElementById('toggleRecording');
 const downloadMidiButton = document.getElementById('downloadMidi');
@@ -30,13 +31,20 @@ const frequencyDisplay = document.getElementById('frequencyDisplay');
 const statusDisplay = document.getElementById('status');
 const noteCountDisplay = document.getElementById('noteCount');
 
+const sensitivitySlider = document.getElementById('sensitivitySlider');
+const peakThresholdSlider = document.getElementById('peakThresholdSlider');
+const noteDurationSlider = document.getElementById('noteDurationSlider');
+const harmonicThresholdSlider = document.getElementById('harmonicThresholdSlider');
+
+// Dynamic detection parameters
+let MIN_AMPLITUDE_THRESHOLD = 20;
+let PEAK_THRESHOLD = 30;
+let NOTE_DURATION_THRESHOLD = 100;
+let HARMONIC_THRESHOLD = 0.3;
+
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const A4_FREQUENCY = 440;
 const MIN_VALID_FREQUENCY = 80; // Increased minimum frequency
-const MIN_AMPLITUDE_THRESHOLD = 20; // Reduced for better sensitivity
-const NOTE_DURATION_THRESHOLD = 100; // Minimum ms for a note to be recorded
-const HARMONIC_THRESHOLD = 0.3; // Minimum ratio for harmonic detection
-const PEAK_THRESHOLD = 30; // Minimum amplitude for frequency peaks
 const LAYER_PITCH_RANGES = {
     bass: { min: 40, max: 200, name: 'Bass' },
     lowMid: { min: 200, max: 500, name: 'Low Mid' },
@@ -52,6 +60,26 @@ toggleRecordingButton.addEventListener('click', () => {
     } else {
         stopRecording();
     }
+});
+
+sensitivitySlider.addEventListener('input', (e) => {
+    MIN_AMPLITUDE_THRESHOLD = parseInt(e.target.value);
+    document.getElementById('sensitivityValue').textContent = e.target.value;
+});
+
+peakThresholdSlider.addEventListener('input', (e) => {
+    PEAK_THRESHOLD = parseInt(e.target.value);
+    document.getElementById('peakThresholdValue').textContent = e.target.value;
+});
+
+noteDurationSlider.addEventListener('input', (e) => {
+    NOTE_DURATION_THRESHOLD = parseInt(e.target.value);
+    document.getElementById('noteDurationValue').textContent = e.target.value;
+});
+
+harmonicThresholdSlider.addEventListener('input', (e) => {
+    HARMONIC_THRESHOLD = parseFloat(e.target.value);
+    document.getElementById('harmonicThresholdValue').textContent = e.target.value;
 });
 
 downloadMidiButton.addEventListener('click', downloadMidiFile);
@@ -377,6 +405,48 @@ function updateLayerDisplay() {
     const validLayers = Array.from(detectedLayers.entries())
         .filter(([id, layer]) => layer.notes.length >= LAYER_PERSISTENCE_THRESHOLD);
     
+    // Show/hide layer management section
+    const layerManagement = document.getElementById('layerManagement');
+    if (validLayers.length > 0) {
+        layerManagement.style.display = 'block';
+        
+        const layerList = document.getElementById('layerList');
+        layerList.innerHTML = '';
+        
+        validLayers.forEach(([id, layer]) => {
+            const layerItem = document.createElement('div');
+            layerItem.className = 'layer-item';
+            
+            const defaultName = LAYER_PITCH_RANGES[id]?.name || id;
+            const customName = customLayerNames.get(id) || defaultName;
+            
+            layerItem.innerHTML = `
+                <div class="layer-info">${defaultName}</div>
+                <input type="text" class="layer-name-input" data-layer-id="${id}" 
+                       value="${customName}" placeholder="Track name">
+                <div class="layer-notes-count">${layer.notes.length} notes</div>
+            `;
+            
+            layerList.appendChild(layerItem);
+        });
+        
+        // Add event listeners for name inputs
+        layerList.querySelectorAll('.layer-name-input').forEach(input => {
+            input.addEventListener('input', (e) => {
+                const layerId = e.target.dataset.layerId;
+                const newName = e.target.value.trim();
+                if (newName) {
+                    customLayerNames.set(layerId, newName);
+                } else {
+                    customLayerNames.delete(layerId);
+                }
+            });
+        });
+    } else {
+        layerManagement.style.display = 'none';
+    }
+
+    // Update the simple layer text display
     let layerText = validLayers.length > 0 
         ? validLayers.map(([id, layer]) => `${LAYER_PITCH_RANGES[id]?.name || id}: ${layer.notes.length}`).join(', ')
         : 'No layers detected';
@@ -474,8 +544,10 @@ function createMidiFile(notes) {
         
         // Add track name and instrument
         if (numTracks > 1) {
-            const layerName = layerNotes[0]?.layerName || `Layer ${trackIndex + 1}`;
-            trackEvents.push(0x00, 0xFF, 0x03, layerName.length, ...Array.from(layerName).map(c => c.charCodeAt(0)));
+            const defaultName = layerNotes[0]?.layerName || `Layer ${trackIndex + 1}`;
+            const customName = customLayerNames.get(layerId) || defaultName;
+            const trackName = customName;
+            trackEvents.push(0x00, 0xFF, 0x03, trackName.length, ...Array.from(trackName).map(c => c.charCodeAt(0)));
             
             // Set instrument based on layer
             const instrument = getInstrumentForLayer(layerId);
@@ -587,10 +659,6 @@ function writeVariableLength(value) {
         value >>= 7;
     }
     return bytes;
-}
-
-function encodeVariableLength(value) {
-    return writeVariableLength(value);
 }
 
 async function downloadMp3File() {
