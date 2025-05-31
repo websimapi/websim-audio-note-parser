@@ -11,9 +11,15 @@ let recordedNotes = [];
 let lastDetectedNote = null;
 let noteStartTime = null;
 let recordingStartTime = null;
+let playbackContext = null;
+let playbackNodes = [];
+let isPlaying = false;
 
 const toggleRecordingButton = document.getElementById('toggleRecording');
 const downloadMidiButton = document.getElementById('downloadMidi');
+const downloadMp3Button = document.getElementById('downloadMp3');
+const playbackButton = document.getElementById('playback');
+const stopPlaybackButton = document.getElementById('stopPlayback');
 const noteDisplay = document.getElementById('noteDisplay');
 const frequencyDisplay = document.getElementById('frequencyDisplay');
 const statusDisplay = document.getElementById('status');
@@ -34,6 +40,9 @@ toggleRecordingButton.addEventListener('click', () => {
 });
 
 downloadMidiButton.addEventListener('click', downloadMidiFile);
+downloadMp3Button.addEventListener('click', downloadMp3File);
+playbackButton.addEventListener('click', playRecording);
+stopPlaybackButton.addEventListener('click', stopPlayback);
 
 async function startRecording() {
     if (isRecording) return;
@@ -72,6 +81,8 @@ async function startRecording() {
         toggleRecordingButton.textContent = 'Stop Recording';
         toggleRecordingButton.classList.add('recording');
         downloadMidiButton.disabled = true;
+        downloadMp3Button.disabled = true;
+        playbackButton.disabled = true;
         statusDisplay.textContent = 'Status: Recording...';
         statusDisplay.className = 'status-recording';
         noteDisplay.textContent = '-';
@@ -148,6 +159,8 @@ function stopRecording() {
     if (wasRecording) console.log("Recording stopped.");
 
     downloadMidiButton.disabled = recordedNotes.length === 0;
+    downloadMp3Button.disabled = recordedNotes.length === 0;
+    playbackButton.disabled = recordedNotes.length === 0;
     noteCountDisplay.textContent = recordedNotes.length.toString();
 }
 
@@ -321,99 +334,250 @@ function downloadMidiFile() {
 function createMidiFile(notes) {
     console.log('Processing notes for MIDI:', notes);
     
-    // Simple MIDI file creation
     const ticksPerQuarter = 480;
-    const microsecondsPerQuarter = 500000; // 120 BPM
     
-    // MIDI header
+    // MIDI header (Type 0, 1 track, 480 ticks per quarter)
     const header = new Uint8Array([
         0x4D, 0x54, 0x68, 0x64, // "MThd"
-        0x00, 0x00, 0x00, 0x06, // Header length
-        0x00, 0x00, // Format 0
-        0x00, 0x01, // 1 track
+        0x00, 0x00, 0x00, 0x06, // Header length (6 bytes)
+        0x00, 0x00, // Format type 0
+        0x00, 0x01, // Number of tracks (1)
         0x01, 0xE0  // Ticks per quarter note (480)
     ]);
     
-    // Track events
-    let trackData = [];
+    let trackEvents = [];
     
-    // Add tempo event at time 0
-    trackData.push(...[0x00, 0xFF, 0x51, 0x03]); // Delta time 0, Meta event, Set Tempo, length 3
-    trackData.push(...[0x07, 0xA1, 0x20]); // 500000 microseconds per quarter note (120 BPM)
+    // Set tempo: 120 BPM (500000 microseconds per quarter note)
+    trackEvents.push(0x00); // Delta time
+    trackEvents.push(0xFF, 0x51, 0x03); // Meta event: Set Tempo
+    trackEvents.push(0x07, 0xA1, 0x20); // 500000 microseconds
     
     // Sort notes by start time
     const sortedNotes = [...notes].sort((a, b) => a.startTime - b.startTime);
     
-    let currentTick = 0;
+    // Convert to MIDI events
+    let events = [];
     
-    for (let i = 0; i < sortedNotes.length; i++) {
-        const note = sortedNotes[i];
+    sortedNotes.forEach(note => {
+        const startTicks = Math.round((note.startTime / 1000) * (ticksPerQuarter * 2)); // 120 BPM = 2 beats per second
+        const durationTicks = Math.max(ticksPerQuarter / 8, Math.round((note.duration / 1000) * (ticksPerQuarter * 2)));
         
-        // Convert milliseconds to ticks: (ms / 1000) * (ticks_per_quarter / (microseconds_per_quarter / 1000000))
-        const startTick = Math.round((note.startTime / 1000) * (ticksPerQuarter / (microsecondsPerQuarter / 1000000)));
-        const durationTicks = Math.max(24, Math.round((note.duration / 1000) * (ticksPerQuarter / (microsecondsPerQuarter / 1000000)))); // Minimum 24 ticks
+        events.push({
+            time: startTicks,
+            type: 'noteOn',
+            note: note.midiNote,
+            velocity: 80
+        });
         
-        // Calculate delta time from current position to note start
-        const deltaTimeStart = Math.max(0, startTick - currentTick);
+        events.push({
+            time: startTicks + durationTicks,
+            type: 'noteOff',
+            note: note.midiNote,
+            velocity: 0
+        });
+    });
+    
+    // Sort all events by time
+    events.sort((a, b) => a.time - b.time);
+    
+    let currentTime = 0;
+    events.forEach(event => {
+        const deltaTime = event.time - currentTime;
+        trackEvents.push(...writeVariableLength(deltaTime));
         
-        console.log(`Note ${i}: ${note.note}${note.octave}, startTime: ${note.startTime}ms, duration: ${note.duration}ms, startTick: ${startTick}, durationTicks: ${durationTicks}, deltaTime: ${deltaTimeStart}`);
+        if (event.type === 'noteOn') {
+            trackEvents.push(0x90, event.note, event.velocity);
+        } else {
+            trackEvents.push(0x80, event.note, event.velocity);
+        }
         
-        // Note on event
-        trackData.push(...encodeVariableLength(deltaTimeStart));
-        trackData.push(0x90); // Note on, channel 0
-        trackData.push(note.midiNote); // Note number
-        trackData.push(80); // Velocity
-        
-        // Note off event
-        trackData.push(...encodeVariableLength(durationTicks));
-        trackData.push(0x80); // Note off, channel 0
-        trackData.push(note.midiNote); // Note number
-        trackData.push(0); // Velocity 0
-        
-        currentTick = startTick + durationTicks;
-    }
+        currentTime = event.time;
+    });
     
     // End of track
-    trackData.push(0x00, 0xFF, 0x2F, 0x00);
-    
-    console.log('Track data length:', trackData.length);
+    trackEvents.push(0x00, 0xFF, 0x2F, 0x00);
     
     // Track header
     const trackHeader = new Uint8Array([
         0x4D, 0x54, 0x72, 0x6B, // "MTrk"
-        ...intToBytes(trackData.length, 4) // Track length
+        (trackEvents.length >> 24) & 0xFF,
+        (trackEvents.length >> 16) & 0xFF,
+        (trackEvents.length >> 8) & 0xFF,
+        trackEvents.length & 0xFF
     ]);
     
-    // Combine all data
-    const midiFile = new Uint8Array(header.length + trackHeader.length + trackData.length);
-    midiFile.set(header, 0);
-    midiFile.set(trackHeader, header.length);
-    midiFile.set(trackData, header.length + trackHeader.length);
+    // Combine everything
+    const result = new Uint8Array(header.length + trackHeader.length + trackEvents.length);
+    result.set(header, 0);
+    result.set(trackHeader, header.length);
+    result.set(trackEvents, header.length + trackHeader.length);
     
-    console.log('MIDI file size:', midiFile.length, 'bytes');
-    return midiFile;
+    return result;
 }
 
-function encodeVariableLength(value) {
-    if (value < 0) value = 0; // Safety check
-    if (value > 0x0FFFFFFF) value = 0x0FFFFFFF; // Safety check
-    
+function writeVariableLength(value) {
     const bytes = [];
     bytes.unshift(value & 0x7F);
     value >>= 7;
-    while (value) {
+    while (value > 0) {
         bytes.unshift((value & 0x7F) | 0x80);
         value >>= 7;
     }
     return bytes;
 }
 
-function intToBytes(value, byteCount) {
-    const bytes = [];
-    for (let i = byteCount - 1; i >= 0; i--) {
-        bytes.push((value >> (8 * i)) & 0xFF);
+function encodeVariableLength(value) {
+    return writeVariableLength(value);
+}
+
+async function downloadMp3File() {
+    if (recordedNotes.length === 0) return;
+    
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const sampleRate = audioCtx.sampleRate;
+    const totalDuration = Math.max(...recordedNotes.map(note => note.startTime + note.duration)) / 1000;
+    const length = Math.ceil(totalDuration * sampleRate);
+    const audioBuffer = audioCtx.createBuffer(1, length, sampleRate);
+    const channelData = audioBuffer.getChannelData(0);
+    
+    // Generate audio for each note
+    recordedNotes.forEach(note => {
+        const startSample = Math.floor((note.startTime / 1000) * sampleRate);
+        const durationSamples = Math.floor((note.duration / 1000) * sampleRate);
+        const frequency = note.frequency;
+        
+        for (let i = 0; i < durationSamples && (startSample + i) < length; i++) {
+            const time = i / sampleRate;
+            const envelope = Math.exp(-time * 2); // Simple decay envelope
+            const sample = Math.sin(2 * Math.PI * frequency * time) * envelope * 0.3;
+            if (startSample + i < channelData.length) {
+                channelData[startSample + i] += sample;
+            }
+        }
+    });
+    
+    // Convert to WAV format (simplified MP3 alternative)
+    const wavData = audioBufferToWav(audioBuffer);
+    const blob = new Blob([wavData], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `recorded_notes_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.wav`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    await audioCtx.close();
+}
+
+function audioBufferToWav(buffer) {
+    const length = buffer.length;
+    const sampleRate = buffer.sampleRate;
+    const arrayBuffer = new ArrayBuffer(44 + length * 2);
+    const view = new DataView(arrayBuffer);
+    const channelData = buffer.getChannelData(0);
+    
+    // WAV header
+    const writeString = (offset, string) => {
+        for (let i = 0; i < string.length; i++) {
+            view.setUint8(offset + i, string.charCodeAt(i));
+        }
+    };
+    
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + length * 2, true);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, 'data');
+    view.setUint32(40, length * 2, true);
+    
+    // Convert float samples to 16-bit PCM
+    let offset = 44;
+    for (let i = 0; i < length; i++) {
+        const sample = Math.max(-1, Math.min(1, channelData[i]));
+        view.setInt16(offset, sample * 0x7FFF, true);
+        offset += 2;
     }
-    return bytes;
+    
+    return arrayBuffer;
+}
+
+async function playRecording() {
+    if (recordedNotes.length === 0 || isPlaying) return;
+    
+    isPlaying = true;
+    playbackButton.disabled = true;
+    stopPlaybackButton.disabled = false;
+    
+    try {
+        playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+        
+        recordedNotes.forEach(note => {
+            const oscillator = playbackContext.createOscillator();
+            const gainNode = playbackContext.createGain();
+            
+            oscillator.connect(gainNode);
+            gainNode.connect(playbackContext.destination);
+            
+            oscillator.frequency.setValueAtTime(note.frequency, playbackContext.currentTime);
+            oscillator.type = 'sine';
+            
+            const startTime = playbackContext.currentTime + (note.startTime / 1000);
+            const endTime = startTime + (note.duration / 1000);
+            
+            gainNode.gain.setValueAtTime(0, playbackContext.currentTime);
+            gainNode.gain.setValueAtTime(0.3, startTime);
+            gainNode.gain.exponentialRampToValueAtTime(0.01, endTime);
+            
+            oscillator.start(startTime);
+            oscillator.stop(endTime);
+            
+            playbackNodes.push({ oscillator, gainNode });
+        });
+        
+        // Auto-stop when done
+        const totalDuration = Math.max(...recordedNotes.map(note => note.startTime + note.duration));
+        setTimeout(() => {
+            if (isPlaying) stopPlayback();
+        }, totalDuration + 1000);
+        
+    } catch (error) {
+        console.error('Playback error:', error);
+        stopPlayback();
+    }
+}
+
+function stopPlayback() {
+    if (!isPlaying) return;
+    
+    isPlaying = false;
+    playbackButton.disabled = false;
+    stopPlaybackButton.disabled = true;
+    
+    playbackNodes.forEach(({ oscillator, gainNode }) => {
+        try {
+            oscillator.stop();
+            oscillator.disconnect();
+            gainNode.disconnect();
+        } catch (e) {
+            // Ignore errors from already stopped nodes
+        }
+    });
+    playbackNodes = [];
+    
+    if (playbackContext) {
+        playbackContext.close().catch(e => console.error('Error closing playback context:', e));
+        playbackContext = null;
+    }
 }
 
 // Initial UI setup
