@@ -14,6 +14,8 @@ let recordingStartTime = null;
 let playbackContext = null;
 let playbackNodes = [];
 let isPlaying = false;
+let activeNotes = new Map(); // Track multiple simultaneous notes
+let harmonicAnalyzer = null;
 
 const toggleRecordingButton = document.getElementById('toggleRecording');
 const downloadMidiButton = document.getElementById('downloadMidi');
@@ -28,8 +30,10 @@ const noteCountDisplay = document.getElementById('noteCount');
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const A4_FREQUENCY = 440;
 const MIN_VALID_FREQUENCY = 80; // Increased minimum frequency
-const MIN_AMPLITUDE_THRESHOLD = 30; // Increased threshold
+const MIN_AMPLITUDE_THRESHOLD = 20; // Reduced for better sensitivity
 const NOTE_DURATION_THRESHOLD = 100; // Minimum ms for a note to be recorded
+const HARMONIC_THRESHOLD = 0.3; // Minimum ratio for harmonic detection
+const PEAK_THRESHOLD = 30; // Minimum amplitude for frequency peaks
 
 toggleRecordingButton.addEventListener('click', () => {
     if (!isRecording) {
@@ -66,7 +70,8 @@ async function startRecording() {
         sourceNode = audioContext.createMediaStreamSource(mediaStream);
         analyser = audioContext.createAnalyser();
 
-        analyser.fftSize = 8192; // Increased for better frequency resolution
+        analyser.fftSize = 16384; // Increased for better frequency resolution
+        analyser.smoothingTimeConstant = 0.3; // Add smoothing
         const bufferLength = analyser.frequencyBinCount;
         dataArray = new Float32Array(analyser.fftSize);
         frequencyData = new Uint8Array(bufferLength);
@@ -75,6 +80,7 @@ async function startRecording() {
 
         isRecording = true;
         recordedNotes = [];
+        activeNotes.clear();
         recordingStartTime = Date.now();
         lastDetectedNote = null;
         noteStartTime = null;
@@ -112,17 +118,18 @@ function stopRecording() {
     const wasRecording = isRecording;
     isRecording = false; 
 
-    // Finalize any ongoing note
-    if (lastDetectedNote && noteStartTime) {
-        const noteDuration = Date.now() - noteStartTime;
+    // Finalize any ongoing notes
+    for (const [noteKey, noteData] of activeNotes) {
+        const noteDuration = Date.now() - noteData.startTime;
         if (noteDuration >= NOTE_DURATION_THRESHOLD) {
             recordedNotes.push({
-                ...lastDetectedNote,
+                ...noteData.noteInfo,
                 duration: noteDuration,
-                startTime: noteStartTime - recordingStartTime
+                startTime: noteData.startTime - recordingStartTime
             });
         }
     }
+    activeNotes.clear();
 
     if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
@@ -179,106 +186,138 @@ function analyzeAudio() {
 
     animationFrameId = requestAnimationFrame(analyzeAudio);
 
-    // Get time domain data for autocorrelation
-    analyser.getFloatTimeDomainData(dataArray);
-    
-    // Also get frequency data for amplitude check
+    // Get frequency domain data for polyphonic detection
     analyser.getByteFrequencyData(frequencyData);
     
     // Check if there's sufficient signal
     const maxAmplitude = Math.max(...frequencyData);
     if (maxAmplitude < MIN_AMPLITUDE_THRESHOLD) {
-        handleNoteChange(null);
+        handleNotesChange([]);
         frequencyDisplay.textContent = '-';
         noteDisplay.textContent = '-';
         return;
     }
 
-    const frequency = detectPitchAutocorrelation(dataArray, audioContext.sampleRate);
+    // Detect multiple frequencies using FFT peak detection
+    const detectedFrequencies = detectMultipleFrequencies(frequencyData, audioContext.sampleRate);
     
-    if (frequency && frequency >= MIN_VALID_FREQUENCY && frequency <= 2000) {
-        frequencyDisplay.textContent = frequency.toFixed(2);
-        const noteInfo = frequencyToNoteAndOctave(frequency);
-        const noteString = noteInfo.name ? `${noteInfo.name}${noteInfo.octave}` : '-';
-        noteDisplay.textContent = noteString;
+    if (detectedFrequencies.length > 0) {
+        const freqDisplay = detectedFrequencies.map(f => f.toFixed(1)).join(', ');
+        frequencyDisplay.textContent = freqDisplay;
         
-        if (noteInfo.name) {
-            handleNoteChange({
-                note: noteInfo.name,
-                octave: noteInfo.octave,
-                frequency: frequency,
+        const noteInfos = detectedFrequencies.map(freq => {
+            const noteInfo = frequencyToNoteAndOctave(freq);
+            return {
+                ...noteInfo,
+                frequency: freq,
                 midiNote: noteToMidi(noteInfo.name, noteInfo.octave)
-            });
-        } else {
-            handleNoteChange(null);
-        }
+            };
+        }).filter(note => note.name);
+        
+        const noteDisplay = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
+        document.getElementById('noteDisplay').textContent = noteDisplay || '-';
+        
+        handleNotesChange(noteInfos);
     } else {
-        handleNoteChange(null);
+        handleNotesChange([]);
         frequencyDisplay.textContent = '-';
         noteDisplay.textContent = '-';
     }
 }
 
-function detectPitchAutocorrelation(buffer, sampleRate) {
-    const SIZE = buffer.length;
-    const sumOfSquares = buffer.reduce((sum, val) => sum + val * val, 0);
+function detectMultipleFrequencies(frequencyData, sampleRate) {
+    const frequencies = [];
+    const nyquist = sampleRate / 2;
+    const binWidth = nyquist / frequencyData.length;
     
-    if (sumOfSquares < 0.001) return null; // Too quiet
-    
-    let bestOffset = -1;
-    let bestCorrelation = 0;
-    let rms = Math.sqrt(sumOfSquares / SIZE);
-    
-    if (rms < 0.01) return null; // Below noise threshold
-    
-    let lastCorrelation = 1;
-    for (let offset = 10; offset < SIZE / 2; offset++) {
-        let correlation = 0;
-        
-        for (let i = 0; i < SIZE - offset; i++) {
-            correlation += Math.abs(buffer[i] - buffer[i + offset]);
+    // Find peaks in frequency spectrum
+    const peaks = [];
+    for (let i = 2; i < frequencyData.length - 2; i++) {
+        const current = frequencyData[i];
+        if (current > PEAK_THRESHOLD &&
+            current > frequencyData[i - 1] &&
+            current > frequencyData[i + 1] &&
+            current > frequencyData[i - 2] &&
+            current > frequencyData[i + 2]) {
+            
+            const frequency = i * binWidth;
+            if (frequency >= MIN_VALID_FREQUENCY && frequency <= 2000) {
+                peaks.push({ frequency, amplitude: current, bin: i });
+            }
         }
-        correlation = 1 - (correlation / (SIZE - offset));
-        
-        if (correlation > 0.9 && correlation > lastCorrelation) {
-            bestCorrelation = correlation;
-            bestOffset = offset;
-        } else if (correlation > 0.9 && bestCorrelation > 0.9) {
-            break; // Found a good peak, stop looking
-        }
-        lastCorrelation = correlation;
     }
     
-    if (bestCorrelation > 0.9 && bestOffset !== -1) {
-        return sampleRate / bestOffset;
+    // Sort peaks by amplitude
+    peaks.sort((a, b) => b.amplitude - a.amplitude);
+    
+    // Filter out harmonics and keep only fundamental frequencies
+    const fundamentals = [];
+    for (const peak of peaks) {
+        let isFundamental = true;
+        
+        // Check if this peak is a harmonic of any existing fundamental
+        for (const fund of fundamentals) {
+            const ratio = peak.frequency / fund.frequency;
+            if (Math.abs(ratio - Math.round(ratio)) < 0.05 && ratio >= 2) {
+                isFundamental = false;
+                break;
+            }
+        }
+        
+        // Check if any existing fundamental is a harmonic of this peak
+        if (isFundamental) {
+            fundamentals.forEach((fund, index) => {
+                const ratio = fund.frequency / peak.frequency;
+                if (Math.abs(ratio - Math.round(ratio)) < 0.05 && ratio >= 2) {
+                    fundamentals[index] = peak; // Replace with lower fundamental
+                }
+            });
+        }
+        
+        if (isFundamental) {
+            fundamentals.push(peak);
+        }
+        
+        // Limit to top 4 simultaneous notes for performance
+        if (fundamentals.length >= 4) break;
     }
     
-    return null;
+    return fundamentals.map(peak => peak.frequency);
 }
 
-function handleNoteChange(currentNote) {
+function handleNotesChange(currentNotes) {
     const now = Date.now();
-    const currentNoteString = currentNote ? `${currentNote.note}${currentNote.octave}` : null;
-    const lastNoteString = lastDetectedNote ? `${lastDetectedNote.note}${lastDetectedNote.octave}` : null;
+    const currentNoteKeys = new Set(currentNotes.map(note => `${note.note}${note.octave}`));
+    const activeNoteKeys = new Set(activeNotes.keys());
     
-    if (currentNoteString !== lastNoteString) {
-        // Note changed or stopped
-        if (lastDetectedNote && noteStartTime) {
-            const noteDuration = now - noteStartTime;
+    // End notes that are no longer detected
+    for (const noteKey of activeNoteKeys) {
+        if (!currentNoteKeys.has(noteKey)) {
+            const noteData = activeNotes.get(noteKey);
+            const noteDuration = now - noteData.startTime;
             if (noteDuration >= NOTE_DURATION_THRESHOLD) {
                 const recordedNote = {
-                    ...lastDetectedNote,
+                    ...noteData.noteInfo,
                     duration: noteDuration,
-                    startTime: noteStartTime - recordingStartTime
+                    startTime: noteData.startTime - recordingStartTime
                 };
                 recordedNotes.push(recordedNote);
                 console.log('Recorded note:', recordedNote);
                 noteCountDisplay.textContent = recordedNotes.length.toString();
             }
+            activeNotes.delete(noteKey);
         }
-        
-        lastDetectedNote = currentNote;
-        noteStartTime = currentNote ? now : null;
+    }
+    
+    // Start new notes
+    for (const note of currentNotes) {
+        const noteKey = `${note.note}${note.octave}`;
+        if (!activeNotes.has(noteKey)) {
+            activeNotes.set(noteKey, {
+                noteInfo: note,
+                startTime: now
+            });
+        }
     }
 }
 
@@ -352,43 +391,47 @@ function createMidiFile(notes) {
     trackEvents.push(0xFF, 0x51, 0x03); // Meta event: Set Tempo
     trackEvents.push(0x07, 0xA1, 0x20); // 500000 microseconds
     
-    // Sort notes by start time
-    const sortedNotes = [...notes].sort((a, b) => a.startTime - b.startTime);
+    // Group overlapping notes to handle polyphony
+    const events = [];
     
-    // Convert to MIDI events
-    let events = [];
-    
-    sortedNotes.forEach(note => {
-        const startTicks = Math.round((note.startTime / 1000) * (ticksPerQuarter * 2)); // 120 BPM = 2 beats per second
-        const durationTicks = Math.max(ticksPerQuarter / 8, Math.round((note.duration / 1000) * (ticksPerQuarter * 2)));
+    notes.forEach(note => {
+        const startTicks = Math.round((note.startTime / 1000) * (ticksPerQuarter * 2));
+        const durationTicks = Math.max(ticksPerQuarter / 16, Math.round((note.duration / 1000) * (ticksPerQuarter * 2)));
         
         events.push({
             time: startTicks,
             type: 'noteOn',
-            note: note.midiNote,
-            velocity: 80
+            note: Math.max(0, Math.min(127, note.midiNote)),
+            velocity: 80,
+            channel: 0
         });
         
         events.push({
             time: startTicks + durationTicks,
             type: 'noteOff',
-            note: note.midiNote,
-            velocity: 0
+            note: Math.max(0, Math.min(127, note.midiNote)),
+            velocity: 0,
+            channel: 0
         });
     });
     
-    // Sort all events by time
-    events.sort((a, b) => a.time - b.time);
+    // Sort all events by time, then by type (noteOff before noteOn for same time)
+    events.sort((a, b) => {
+        if (a.time !== b.time) return a.time - b.time;
+        if (a.type === 'noteOff' && b.type === 'noteOn') return -1;
+        if (a.type === 'noteOn' && b.type === 'noteOff') return 1;
+        return 0;
+    });
     
     let currentTime = 0;
     events.forEach(event => {
-        const deltaTime = event.time - currentTime;
+        const deltaTime = Math.max(0, event.time - currentTime);
         trackEvents.push(...writeVariableLength(deltaTime));
         
         if (event.type === 'noteOn') {
-            trackEvents.push(0x90, event.note, event.velocity);
+            trackEvents.push(0x90 | event.channel, event.note, event.velocity);
         } else {
-            trackEvents.push(0x80, event.note, event.velocity);
+            trackEvents.push(0x80 | event.channel, event.note, event.velocity);
         }
         
         currentTime = event.time;
@@ -437,10 +480,11 @@ async function downloadMp3File() {
     const sampleRate = audioCtx.sampleRate;
     const totalDuration = Math.max(...recordedNotes.map(note => note.startTime + note.duration)) / 1000;
     const length = Math.ceil(totalDuration * sampleRate);
-    const audioBuffer = audioCtx.createBuffer(1, length, sampleRate);
-    const channelData = audioBuffer.getChannelData(0);
+    const audioBuffer = audioCtx.createBuffer(2, length, sampleRate); // Stereo
+    const leftChannel = audioBuffer.getChannelData(0);
+    const rightChannel = audioBuffer.getChannelData(1);
     
-    // Generate audio for each note
+    // Generate audio for each note with better synthesis
     recordedNotes.forEach(note => {
         const startSample = Math.floor((note.startTime / 1000) * sampleRate);
         const durationSamples = Math.floor((note.duration / 1000) * sampleRate);
@@ -448,10 +492,34 @@ async function downloadMp3File() {
         
         for (let i = 0; i < durationSamples && (startSample + i) < length; i++) {
             const time = i / sampleRate;
-            const envelope = Math.exp(-time * 2); // Simple decay envelope
-            const sample = Math.sin(2 * Math.PI * frequency * time) * envelope * 0.3;
-            if (startSample + i < channelData.length) {
-                channelData[startSample + i] += sample;
+            // Better envelope with attack, decay, sustain, release
+            let envelope = 1;
+            const attackTime = 0.1;
+            const decayTime = 0.2;
+            const sustainLevel = 0.7;
+            const releaseTime = 0.3;
+            const noteDuration = durationSamples / sampleRate;
+            
+            if (time < attackTime) {
+                envelope = time / attackTime;
+            } else if (time < attackTime + decayTime) {
+                envelope = 1 - (1 - sustainLevel) * (time - attackTime) / decayTime;
+            } else if (time < noteDuration - releaseTime) {
+                envelope = sustainLevel;
+            } else {
+                envelope = sustainLevel * (noteDuration - time) / releaseTime;
+            }
+            
+            // Add some harmonics for richer sound
+            const fundamental = Math.sin(2 * Math.PI * frequency * time);
+            const harmonic2 = Math.sin(2 * Math.PI * frequency * 2 * time) * 0.3;
+            const harmonic3 = Math.sin(2 * Math.PI * frequency * 3 * time) * 0.1;
+            
+            const sample = (fundamental + harmonic2 + harmonic3) * envelope * 0.2;
+            
+            if (startSample + i < leftChannel.length) {
+                leftChannel[startSample + i] += sample;
+                rightChannel[startSample + i] += sample;
             }
         }
     });
@@ -475,9 +543,10 @@ async function downloadMp3File() {
 function audioBufferToWav(buffer) {
     const length = buffer.length;
     const sampleRate = buffer.sampleRate;
-    const arrayBuffer = new ArrayBuffer(44 + length * 2);
+    const arrayBuffer = new ArrayBuffer(44 + length * 2 * 2);
     const view = new DataView(arrayBuffer);
-    const channelData = buffer.getChannelData(0);
+    const leftChannel = buffer.getChannelData(0);
+    const rightChannel = buffer.getChannelData(1);
     
     // WAV header
     const writeString = (offset, string) => {
@@ -487,24 +556,27 @@ function audioBufferToWav(buffer) {
     };
     
     writeString(0, 'RIFF');
-    view.setUint32(4, 36 + length * 2, true);
+    view.setUint32(4, 36 + length * 2 * 2, true);
     writeString(8, 'WAVE');
     writeString(12, 'fmt ');
     view.setUint32(16, 16, true);
     view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
+    view.setUint16(22, 2, true);
     view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
+    view.setUint32(28, sampleRate * 2 * 2, true);
+    view.setUint16(32, 2 * 2, true);
     view.setUint16(34, 16, true);
     writeString(36, 'data');
-    view.setUint32(40, length * 2, true);
+    view.setUint32(40, length * 2 * 2, true);
     
     // Convert float samples to 16-bit PCM
     let offset = 44;
     for (let i = 0; i < length; i++) {
-        const sample = Math.max(-1, Math.min(1, channelData[i]));
-        view.setInt16(offset, sample * 0x7FFF, true);
+        const leftSample = Math.max(-1, Math.min(1, leftChannel[i]));
+        const rightSample = Math.max(-1, Math.min(1, rightChannel[i]));
+        view.setInt16(offset, leftSample * 0x7FFF, true);
+        offset += 2;
+        view.setInt16(offset, rightSample * 0x7FFF, true);
         offset += 2;
     }
     
