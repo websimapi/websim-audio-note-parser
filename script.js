@@ -318,7 +318,8 @@ function downloadMidiFile() {
 function createMidiFile(notes) {
     // Simple MIDI file creation
     const ticksPerQuarter = 480;
-    const tempo = 500000; // 120 BPM
+    const bpm = 120;
+    const tempo = 500000; // 120 BPM in microseconds per quarter note
     
     // MIDI header
     const header = new Uint8Array([
@@ -338,18 +339,18 @@ function createMidiFile(notes) {
     let lastTime = 0;
     
     for (const note of notes) {
-        const startTicks = Math.round((note.startTime * ticksPerQuarter) / 500); // Convert ms to ticks
-        const durationTicks = Math.round((note.duration * ticksPerQuarter) / 500);
+        // Convert milliseconds to MIDI ticks: ms * ticks_per_quarter * bpm / 60000
+        const startTicks = Math.max(0, Math.round((note.startTime * ticksPerQuarter * bpm) / 60000));
+        const durationTicks = Math.max(1, Math.round((note.duration * ticksPerQuarter * bpm) / 60000));
         
-        const deltaTimeStart = startTicks - lastTime;
-        const deltaTimeEnd = durationTicks;
+        const deltaTimeStart = Math.max(0, startTicks - lastTime);
         
         // Note on
         trackData.push(...encodeVariableLength(deltaTimeStart));
         trackData.push(0x90, note.midiNote, 64); // Note on, velocity 64
         
         // Note off
-        trackData.push(...encodeVariableLength(deltaTimeEnd));
+        trackData.push(...encodeVariableLength(durationTicks));
         trackData.push(0x80, note.midiNote, 0); // Note off
         
         lastTime = startTicks + durationTicks;
@@ -374,6 +375,9 @@ function createMidiFile(notes) {
 }
 
 function encodeVariableLength(value) {
+    if (value < 0) value = 0; // Safety check
+    if (value > 0x0FFFFFFF) value = 0x0FFFFFFF; // Safety check
+    
     const bytes = [];
     bytes.unshift(value & 0x7F);
     value >>= 7;
