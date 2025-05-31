@@ -16,6 +16,8 @@ let playbackNodes = [];
 let isPlaying = false;
 let activeNotes = new Map(); // Track multiple simultaneous notes
 let harmonicAnalyzer = null;
+let detectedLayers = new Map(); // Track different instrument layers
+let layerClassifier = null;
 
 const toggleRecordingButton = document.getElementById('toggleRecording');
 const downloadMidiButton = document.getElementById('downloadMidi');
@@ -35,6 +37,14 @@ const MIN_AMPLITUDE_THRESHOLD = 20; // Reduced for better sensitivity
 const NOTE_DURATION_THRESHOLD = 100; // Minimum ms for a note to be recorded
 const HARMONIC_THRESHOLD = 0.3; // Minimum ratio for harmonic detection
 const PEAK_THRESHOLD = 30; // Minimum amplitude for frequency peaks
+const LAYER_PITCH_RANGES = {
+    bass: { min: 40, max: 200, name: 'Bass' },
+    lowMid: { min: 200, max: 500, name: 'Low Mid' },
+    mid: { min: 500, max: 1000, name: 'Mid' },
+    highMid: { min: 1000, max: 2000, name: 'High Mid' },
+    treble: { min: 2000, max: 4000, name: 'Treble' }
+};
+const LAYER_PERSISTENCE_THRESHOLD = 3; // Minimum notes in a layer to consider it valid
 
 toggleRecordingButton.addEventListener('click', () => {
     if (!isRecording) {
@@ -83,6 +93,7 @@ async function startRecording() {
         isRecording = true;
         recordedNotes = [];
         activeNotes.clear();
+        detectedLayers.clear();
         recordingStartTime = Date.now();
         lastDetectedNote = null;
         noteStartTime = null;
@@ -125,11 +136,19 @@ function stopRecording() {
     for (const [noteKey, noteData] of activeNotes) {
         const noteDuration = Date.now() - noteData.startTime;
         if (noteDuration >= NOTE_DURATION_THRESHOLD) {
-            recordedNotes.push({
+            const layer = classifyIntoLayer(noteData.noteInfo.frequency);
+            const recordedNote = {
                 ...noteData.noteInfo,
                 duration: noteDuration,
-                startTime: noteData.startTime - recordingStartTime
-            });
+                startTime: noteData.startTime - recordingStartTime,
+                layer: layer.id,
+                layerName: layer.name
+            };
+            recordedNotes.push(recordedNote);
+            updateLayerTracking(layer.id, recordedNote);
+            console.log('Recorded note:', recordedNote);
+            noteCountDisplay.textContent = recordedNotes.length.toString();
+            updateLayerDisplay();
         }
     }
     activeNotes.clear();
@@ -218,8 +237,8 @@ function analyzeAudio() {
             };
         }).filter(note => note.name);
         
-        const noteDisplay = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
-        document.getElementById('noteDisplay').textContent = noteDisplay || '-';
+        const noteDisplayText = noteInfos.map(note => `${note.name}${note.octave}`).join(', ');
+        document.getElementById('noteDisplay').textContent = noteDisplayText || '-';
         
         handleNotesChange(noteInfos);
     } else {
@@ -291,7 +310,7 @@ function detectMultipleFrequencies(frequencyData, sampleRate) {
 
 function handleNotesChange(currentNotes) {
     const now = Date.now();
-    const currentNoteKeys = new Set(currentNotes.map(note => `${note.note}${note.octave}`));
+    const currentNoteKeys = new Set(currentNotes.map(note => `${note.name}${note.octave}`));
     const activeNoteKeys = new Set(activeNotes.keys());
     
     // End notes that are no longer detected
@@ -300,14 +319,19 @@ function handleNotesChange(currentNotes) {
             const noteData = activeNotes.get(noteKey);
             const noteDuration = now - noteData.startTime;
             if (noteDuration >= NOTE_DURATION_THRESHOLD) {
+                const layer = classifyIntoLayer(noteData.noteInfo.frequency);
                 const recordedNote = {
                     ...noteData.noteInfo,
                     duration: noteDuration,
-                    startTime: noteData.startTime - recordingStartTime
+                    startTime: noteData.startTime - recordingStartTime,
+                    layer: layer.id,
+                    layerName: layer.name
                 };
                 recordedNotes.push(recordedNote);
+                updateLayerTracking(layer.id, recordedNote);
                 console.log('Recorded note:', recordedNote);
                 noteCountDisplay.textContent = recordedNotes.length.toString();
+                updateLayerDisplay();
             }
             activeNotes.delete(noteKey);
         }
@@ -315,7 +339,7 @@ function handleNotesChange(currentNotes) {
     
     // Start new notes
     for (const note of currentNotes) {
-        const noteKey = `${note.note}${note.octave}`;
+        const noteKey = `${note.name}${note.octave}`;
         if (!activeNotes.has(noteKey)) {
             activeNotes.set(noteKey, {
                 noteInfo: note,
@@ -323,6 +347,49 @@ function handleNotesChange(currentNotes) {
             });
         }
     }
+}
+
+function classifyIntoLayer(frequency) {
+    for (const [id, range] of Object.entries(LAYER_PITCH_RANGES)) {
+        if (frequency >= range.min && frequency <= range.max) {
+            return { id, name: range.name };
+        }
+    }
+    return { id: 'other', name: 'Other' };
+}
+
+function updateLayerTracking(layerId, note) {
+    if (!detectedLayers.has(layerId)) {
+        detectedLayers.set(layerId, {
+            notes: [],
+            averageFreq: 0,
+            lastActivity: Date.now()
+        });
+    }
+    
+    const layer = detectedLayers.get(layerId);
+    layer.notes.push(note);
+    layer.averageFreq = layer.notes.reduce((sum, n) => sum + n.frequency, 0) / layer.notes.length;
+    layer.lastActivity = Date.now();
+}
+
+function updateLayerDisplay() {
+    const validLayers = Array.from(detectedLayers.entries())
+        .filter(([id, layer]) => layer.notes.length >= LAYER_PERSISTENCE_THRESHOLD);
+    
+    let layerText = validLayers.length > 0 
+        ? validLayers.map(([id, layer]) => `${LAYER_PITCH_RANGES[id]?.name || id}: ${layer.notes.length}`).join(', ')
+        : 'No layers detected';
+    
+    // Update or create layer display
+    let layerDisplay = document.getElementById('layerDisplay');
+    if (!layerDisplay) {
+        layerDisplay = document.createElement('div');
+        layerDisplay.id = 'layerDisplay';
+        layerDisplay.innerHTML = '<p>Detected Layers: <span id="layerText">-</span></p>';
+        document.getElementById('recordedNotes').insertAdjacentElement('afterend', layerDisplay);
+    }
+    document.getElementById('layerText').textContent = layerText;
 }
 
 function noteToMidi(noteName, octave) {
@@ -375,91 +442,140 @@ function downloadMidiFile() {
 }
 
 function createMidiFile(notes) {
-    console.log('Processing notes for MIDI:', notes);
+    console.log('Processing notes for MIDI with layers:', notes);
     
     const ticksPerQuarter = 480;
     
-    // MIDI header (Type 0, 1 track, 480 ticks per quarter)
+    // Group notes by layer
+    const layerGroups = {};
+    notes.forEach(note => {
+        const layerId = note.layer || 'default';
+        if (!layerGroups[layerId]) {
+            layerGroups[layerId] = [];
+        }
+        layerGroups[layerId].push(note);
+    });
+    
+    const numTracks = Math.max(1, Object.keys(layerGroups).length);
+    
+    // MIDI header (Type 1 for multiple tracks, or Type 0 for single track)
     const header = new Uint8Array([
         0x4D, 0x54, 0x68, 0x64, // "MThd"
         0x00, 0x00, 0x00, 0x06, // Header length (6 bytes)
-        0x00, 0x00, // Format type 0
-        0x00, 0x01, // Number of tracks (1)
+        numTracks > 1 ? 0x00 : 0x00, numTracks > 1 ? 0x01 : 0x00, // Format type
+        (numTracks >> 8) & 0xFF, numTracks & 0xFF, // Number of tracks
         0x01, 0xE0  // Ticks per quarter note (480)
     ]);
     
-    let trackEvents = [];
+    const allTracks = [];
     
-    // Set tempo: 120 BPM (500000 microseconds per quarter note)
-    trackEvents.push(0x00); // Delta time
-    trackEvents.push(0xFF, 0x51, 0x03); // Meta event: Set Tempo
-    trackEvents.push(0x07, 0xA1, 0x20); // 500000 microseconds
-    
-    // Group overlapping notes to handle polyphony
-    const events = [];
-    
-    notes.forEach(note => {
-        const startTicks = Math.round((note.startTime / 1000) * (ticksPerQuarter * 2));
-        const durationTicks = Math.max(ticksPerQuarter / 16, Math.round((note.duration / 1000) * (ticksPerQuarter * 2)));
+    Object.entries(layerGroups).forEach(([layerId, layerNotes], trackIndex) => {
+        let trackEvents = [];
         
-        events.push({
-            time: startTicks,
-            type: 'noteOn',
-            note: Math.max(0, Math.min(127, note.midiNote)),
-            velocity: 80,
-            channel: 0
-        });
-        
-        events.push({
-            time: startTicks + durationTicks,
-            type: 'noteOff',
-            note: Math.max(0, Math.min(127, note.midiNote)),
-            velocity: 0,
-            channel: 0
-        });
-    });
-    
-    // Sort all events by time, then by type (noteOff before noteOn for same time)
-    events.sort((a, b) => {
-        if (a.time !== b.time) return a.time - b.time;
-        if (a.type === 'noteOff' && b.type === 'noteOn') return -1;
-        if (a.type === 'noteOn' && b.type === 'noteOff') return 1;
-        return 0;
-    });
-    
-    let currentTime = 0;
-    events.forEach(event => {
-        const deltaTime = Math.max(0, event.time - currentTime);
-        trackEvents.push(...writeVariableLength(deltaTime));
-        
-        if (event.type === 'noteOn') {
-            trackEvents.push(0x90 | event.channel, event.note, event.velocity);
-        } else {
-            trackEvents.push(0x80 | event.channel, event.note, event.velocity);
+        // Add track name and instrument
+        if (numTracks > 1) {
+            const layerName = layerNotes[0]?.layerName || `Layer ${trackIndex + 1}`;
+            trackEvents.push(0x00, 0xFF, 0x03, layerName.length, ...Array.from(layerName).map(c => c.charCodeAt(0)));
+            
+            // Set instrument based on layer
+            const instrument = getInstrumentForLayer(layerId);
+            trackEvents.push(0x00, 0xC0 | trackIndex, instrument);
         }
         
-        currentTime = event.time;
+        // Set tempo (only on first track)
+        if (trackIndex === 0) {
+            trackEvents.push(0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20);
+        }
+        
+        const events = [];
+        
+        layerNotes.forEach(note => {
+            const startTicks = Math.round((note.startTime / 1000) * (ticksPerQuarter * 2));
+            const durationTicks = Math.max(ticksPerQuarter / 16, Math.round((note.duration / 1000) * (ticksPerQuarter * 2)));
+            
+            events.push({
+                time: startTicks,
+                type: 'noteOn',
+                note: Math.max(0, Math.min(127, note.midiNote)),
+                velocity: 80,
+                channel: trackIndex % 16
+            });
+            
+            events.push({
+                time: startTicks + durationTicks,
+                type: 'noteOff',
+                note: Math.max(0, Math.min(127, note.midiNote)),
+                velocity: 0,
+                channel: trackIndex % 16
+            });
+        });
+        
+        events.sort((a, b) => {
+            if (a.time !== b.time) return a.time - b.time;
+            if (a.type === 'noteOff' && b.type === 'noteOn') return -1;
+            if (a.type === 'noteOn' && b.type === 'noteOff') return 1;
+            return 0;
+        });
+        
+        let currentTime = 0;
+        events.forEach(event => {
+            const deltaTime = Math.max(0, event.time - currentTime);
+            trackEvents.push(...writeVariableLength(deltaTime));
+            
+            if (event.type === 'noteOn') {
+                trackEvents.push(0x90 | event.channel, event.note, event.velocity);
+            } else {
+                trackEvents.push(0x80 | event.channel, event.note, event.velocity);
+            }
+            
+            currentTime = event.time;
+        });
+        
+        // End of track
+        trackEvents.push(0x00, 0xFF, 0x2F, 0x00);
+        allTracks.push(trackEvents);
     });
     
-    // End of track
-    trackEvents.push(0x00, 0xFF, 0x2F, 0x00);
+    // Combine header and all tracks
+    let totalSize = header.length;
+    const trackHeaders = allTracks.map(track => {
+        const trackHeader = new Uint8Array([
+            0x4D, 0x54, 0x72, 0x6B, // "MTrk"
+            (track.length >> 24) & 0xFF,
+            (track.length >> 16) & 0xFF,
+            (track.length >> 8) & 0xFF,
+            track.length & 0xFF
+        ]);
+        totalSize += trackHeader.length + track.length;
+        return trackHeader;
+    });
     
-    // Track header
-    const trackHeader = new Uint8Array([
-        0x4D, 0x54, 0x72, 0x6B, // "MTrk"
-        (trackEvents.length >> 24) & 0xFF,
-        (trackEvents.length >> 16) & 0xFF,
-        (trackEvents.length >> 8) & 0xFF,
-        trackEvents.length & 0xFF
-    ]);
+    const result = new Uint8Array(totalSize);
+    let offset = 0;
     
-    // Combine everything
-    const result = new Uint8Array(header.length + trackHeader.length + trackEvents.length);
-    result.set(header, 0);
-    result.set(trackHeader, header.length);
-    result.set(trackEvents, header.length + trackHeader.length);
+    result.set(header, offset);
+    offset += header.length;
+    
+    allTracks.forEach((track, index) => {
+        result.set(trackHeaders[index], offset);
+        offset += trackHeaders[index].length;
+        result.set(track, offset);
+        offset += track.length;
+    });
     
     return result;
+}
+
+function getInstrumentForLayer(layerId) {
+    const instrumentMap = {
+        bass: 32, // Acoustic Bass
+        lowMid: 33, // Electric Bass
+        mid: 0, // Acoustic Grand Piano
+        highMid: 40, // Violin
+        treble: 73, // Flute
+        other: 0 // Default Piano
+    };
+    return instrumentMap[layerId] || 0;
 }
 
 function writeVariableLength(value) {
