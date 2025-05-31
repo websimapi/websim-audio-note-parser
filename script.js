@@ -1,5 +1,4 @@
 // Global variables
-import Essentia from 'essentia.js';
 
 let audioContext;
 let analyser;
@@ -119,10 +118,30 @@ async function startRecording() {
     try {
         statusDisplay.textContent = 'Status: Initializing Essentia...';
         
-        // Initialize Essentia.js
+        // Initialize Essentia.js properly
         if (!essentia) {
-            essentia = new Essentia();
-            await essentia.initialize();
+            // Load Essentia as a script since the module import isn't working
+            if (!window.Essentia) {
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/essentia.js@0.1.3/dist/essentia-wasm.web.js';
+                document.head.appendChild(script);
+                
+                await new Promise((resolve, reject) => {
+                    script.onload = resolve;
+                    script.onerror = reject;
+                });
+                
+                // Wait a bit more for the library to initialize
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+            
+            if (window.Essentia) {
+                essentia = new window.Essentia();
+                await essentia.initialize();
+            } else {
+                console.warn('Essentia.js not available, using fallback detection');
+                essentia = null;
+            }
         }
 
         statusDisplay.textContent = 'Status: Requesting permissions...';
