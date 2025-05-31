@@ -3,30 +3,27 @@ let audioContext;
 let analyser;
 let mediaStream;
 let sourceNode;
-let dataArray; // Uint8Array for frequency data
+let dataArray; // Float32Array for time domain data
+let frequencyData; // Uint8Array for frequency data
 let animationFrameId;
 let isRecording = false;
+let recordedNotes = [];
+let lastDetectedNote = null;
+let noteStartTime = null;
+let recordingStartTime = null;
 
 const toggleRecordingButton = document.getElementById('toggleRecording');
+const downloadMidiButton = document.getElementById('downloadMidi');
 const noteDisplay = document.getElementById('noteDisplay');
 const frequencyDisplay = document.getElementById('frequencyDisplay');
 const statusDisplay = document.getElementById('status');
-const sheetMusicJsonTextarea = document.getElementById('sheetMusicJson');
-const downloadJsonButton = document.getElementById('downloadJsonButton');
-const sheetMusicOutputContainer = document.getElementById('sheetMusicOutputContainer');
+const noteCountDisplay = document.getElementById('noteCount');
 
-// Note detection constants
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const A4_FREQUENCY = 440;
-const MIN_VALID_FREQUENCY = 20; // Minimum frequency to consider for note detection
-const MIN_AMPLITUDE_THRESHOLD = 20; // Minimum amplitude (0-255) to consider a peak valid
-const MIN_NOTE_DURATION_THRESHOLD = 0.05; // Minimum duration in seconds for a note to be recorded (50ms)
-
-// New global variables for sheet music generation
-let recordedSheetMusic = [];
-let currentNoteStartTime = 0; // Timestamp for the start of the currently detected note segment
-let lastDetectedNoteInfo = null; // Stores { name, octave } of the last processed note, or null
-let recordingStartTime = 0; // performance.now() timestamp when recording actually begins processing audio
+const MIN_VALID_FREQUENCY = 80; // Increased minimum frequency
+const MIN_AMPLITUDE_THRESHOLD = 30; // Increased threshold
+const NOTE_DURATION_THRESHOLD = 100; // Minimum ms for a note to be recorded
 
 toggleRecordingButton.addEventListener('click', () => {
     if (!isRecording) {
@@ -36,23 +33,7 @@ toggleRecordingButton.addEventListener('click', () => {
     }
 });
 
-downloadJsonButton.addEventListener('click', () => {
-    const jsonString = sheetMusicJsonTextarea.value;
-    if (!jsonString || jsonString === 'No notes recorded.' || recordedSheetMusic.length === 0) {
-        alert("No sheet music data to download. Record something first.");
-        return;
-    }
-    const blob = new Blob([jsonString], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    a.download = `recorded_melody_${timestamp}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-});
+downloadMidiButton.addEventListener('click', downloadMidiFile);
 
 async function startRecording() {
     if (isRecording) return;
@@ -61,12 +42,7 @@ async function startRecording() {
         statusDisplay.textContent = 'Status: Requesting permissions...';
         mediaStream = await navigator.mediaDevices.getDisplayMedia({
             video: true, 
-            audio: {
-                // Optional: Add noise suppression, echo cancellation if needed,
-                // but these can sometimes interfere with music.
-                // noiseSuppression: true,
-                // echoCancellation: true
-            }
+            audio: true,
         });
 
         if (!mediaStream.getAudioTracks().length) {
@@ -81,39 +57,33 @@ async function startRecording() {
         sourceNode = audioContext.createMediaStreamSource(mediaStream);
         analyser = audioContext.createAnalyser();
 
-        analyser.fftSize = 4096; 
-        // analyser.smoothingTimeConstant = 0.2; // Optional: smooths out readings, might delay note changes
+        analyser.fftSize = 8192; // Increased for better frequency resolution
         const bufferLength = analyser.frequencyBinCount;
-        dataArray = new Uint8Array(bufferLength);
+        dataArray = new Float32Array(analyser.fftSize);
+        frequencyData = new Uint8Array(bufferLength);
 
         sourceNode.connect(analyser);
-        // Do not connect analyser to destination to avoid echo/feedback
-        // analyser.connect(audioContext.destination); 
 
         isRecording = true;
+        recordedNotes = [];
+        recordingStartTime = Date.now();
+        lastDetectedNote = null;
+        noteStartTime = null;
         toggleRecordingButton.textContent = 'Stop Recording';
         toggleRecordingButton.classList.add('recording');
+        downloadMidiButton.disabled = true;
         statusDisplay.textContent = 'Status: Recording...';
         statusDisplay.className = 'status-recording';
         noteDisplay.textContent = '-';
         frequencyDisplay.textContent = '-';
-        sheetMusicJsonTextarea.value = ''; // Clear previous JSON
-        downloadJsonButton.disabled = true;
-        sheetMusicOutputContainer.style.display = 'none';
-
-
-        // Initialize sheet music recording variables
-        recordedSheetMusic = [];
-        lastDetectedNoteInfo = null;
-        currentNoteStartTime = 0; 
-        recordingStartTime = performance.now(); // Mark the actual start time for note timing
+        noteCountDisplay.textContent = '0';
 
         analyzeAudio();
 
         mediaStream.getTracks().forEach(track => {
             track.onended = () => {
-                console.log('Media stream track ended (e.g., user stopped sharing).');
-                if (isRecording) { 
+                console.log('Media stream track ended.');
+                if (isRecording) { // If recording was active and stopped by browser UI
                     stopRecording();
                 }
             };
@@ -123,33 +93,30 @@ async function startRecording() {
         console.error("Error starting recording:", err);
         statusDisplay.textContent = `Error: ${err.name === 'NotAllowedError' ? 'Permission denied.' : err.message}`;
         statusDisplay.className = 'status-error';
-        stopRecording(); 
+        stopRecording(); // Clean up any partial setup
     }
 }
 
 function stopRecording() {
-    const wasActivelyRecording = isRecording; // Check if we were in a recording state
-    
+    const wasRecording = isRecording;
+    isRecording = false; 
+
+    // Finalize any ongoing note
+    if (lastDetectedNote && noteStartTime) {
+        const noteDuration = Date.now() - noteStartTime;
+        if (noteDuration >= NOTE_DURATION_THRESHOLD) {
+            recordedNotes.push({
+                ...lastDetectedNote,
+                duration: noteDuration,
+                startTime: noteStartTime - recordingStartTime
+            });
+        }
+    }
+
     if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
         animationFrameId = null;
     }
-    
-    // Finalize the last note if one was being tracked
-    if (wasActivelyRecording && recordingStartTime > 0 && lastDetectedNoteInfo && lastDetectedNoteInfo.name) {
-        const currentTime = (performance.now() - recordingStartTime) / 1000.0;
-        const duration = currentTime - currentNoteStartTime;
-        if (duration >= MIN_NOTE_DURATION_THRESHOLD) {
-            recordedSheetMusic.push({
-                pitch: lastDetectedNoteInfo.name,
-                octave: lastDetectedNoteInfo.octave,
-                startTime: parseFloat(currentNoteStartTime.toFixed(3)),
-                duration: parseFloat(duration.toFixed(3))
-            });
-        }
-    }
-    lastDetectedNoteInfo = null; // Reset for next recording session
-    isRecording = false; // Set isRecording to false now
 
     stopMediaStream();
 
@@ -157,6 +124,7 @@ function stopRecording() {
         sourceNode.disconnect();
         sourceNode = null;
     }
+    // Analyser does not need explicit disconnect if source is disconnected and it's not connected to destination
     analyser = null; 
     
     if (audioContext && audioContext.state !== 'closed') {
@@ -165,33 +133,22 @@ function stopRecording() {
     audioContext = null;
     
     dataArray = null;
+    frequencyData = null;
 
     toggleRecordingButton.textContent = 'Start Recording';
     toggleRecordingButton.classList.remove('recording');
     
-    if (statusDisplay.className !== 'status-error' || wasActivelyRecording) {
-      statusDisplay.textContent = 'Status: Idle';
-      statusDisplay.className = 'status-idle';
+    // Only change status to Idle if it wasn't an error state or if it was actively stopped
+    if (wasRecording || statusDisplay.className !== 'status-error') {
+        statusDisplay.textContent = 'Status: Idle';
+        statusDisplay.className = 'status-idle';
     }
-    // Keep note/frequency display as is from last frame or clear them
-    // noteDisplay.textContent = '-';
-    // frequencyDisplay.textContent = '-';
+    noteDisplay.textContent = '-';
+    frequencyDisplay.textContent = '-';
+    if (wasRecording) console.log("Recording stopped.");
 
-    // Generate and display JSON
-    if (recordedSheetMusic && recordedSheetMusic.length > 0) {
-        const jsonString = generateSheetMusicJSON();
-        sheetMusicJsonTextarea.value = jsonString;
-        downloadJsonButton.disabled = false;
-        sheetMusicOutputContainer.style.display = 'block';
-    } else {
-        sheetMusicJsonTextarea.value = 'No notes recorded.';
-        downloadJsonButton.disabled = true;
-        sheetMusicOutputContainer.style.display = 'block'; // Show container even if no notes, to display message
-    }
-    
-    recordingStartTime = 0; // Reset recording start time
-
-    if (wasActivelyRecording) console.log("Recording stopped. Notes recorded:", recordedSheetMusic.length);
+    downloadMidiButton.disabled = recordedNotes.length === 0;
+    noteCountDisplay.textContent = recordedNotes.length.toString();
 }
 
 function stopMediaStream() {
@@ -205,79 +162,114 @@ function stopMediaStream() {
 }
 
 function analyzeAudio() {
-    if (!isRecording || !analyser || !audioContext || !dataArray || recordingStartTime === 0) {
-        if (isRecording && recordingStartTime === 0) { // Still waiting for recordingStartTime to be set
-             animationFrameId = requestAnimationFrame(analyzeAudio);
-        }
+    if (!isRecording || !analyser || !audioContext || !dataArray) return;
+
+    animationFrameId = requestAnimationFrame(analyzeAudio);
+
+    // Get time domain data for autocorrelation
+    analyser.getFloatTimeDomainData(dataArray);
+    
+    // Also get frequency data for amplitude check
+    analyser.getByteFrequencyData(frequencyData);
+    
+    // Check if there's sufficient signal
+    const maxAmplitude = Math.max(...frequencyData);
+    if (maxAmplitude < MIN_AMPLITUDE_THRESHOLD) {
+        handleNoteChange(null);
+        frequencyDisplay.textContent = '-';
+        noteDisplay.textContent = '-';
         return;
     }
 
-    animationFrameId = requestAnimationFrame(analyzeAudio);
-    analyser.getByteFrequencyData(dataArray);
-
-    let maxAmplitude = 0;
-    let dominantFrequencyBin = -1;
-
-    for (let i = 0; i < dataArray.length; i++) {
-        if (dataArray[i] > maxAmplitude) {
-            maxAmplitude = dataArray[i];
-            dominantFrequencyBin = i;
-        }
-    }
+    const frequency = detectPitchAutocorrelation(dataArray, audioContext.sampleRate);
     
-    const currentTime = (performance.now() - recordingStartTime) / 1000.0;
-    let currentDetectedNote = null; // {name, octave} or null for this frame
-
-    if (dominantFrequencyBin !== -1 && maxAmplitude > MIN_AMPLITUDE_THRESHOLD) {
-        const binFrequency = dominantFrequencyBin * audioContext.sampleRate / analyser.fftSize;
-        if (binFrequency >= MIN_VALID_FREQUENCY) {
-            const noteInfo = frequencyToNoteAndOctave(binFrequency);
-            if (noteInfo.name) {
-                currentDetectedNote = noteInfo;
-                frequencyDisplay.textContent = binFrequency.toFixed(2);
-                noteDisplay.textContent = `${noteInfo.name}${noteInfo.octave}`;
-            } else {
-                frequencyDisplay.textContent = binFrequency.toFixed(2);
-                noteDisplay.textContent = '-';
-            }
+    if (frequency && frequency >= MIN_VALID_FREQUENCY && frequency <= 2000) {
+        frequencyDisplay.textContent = frequency.toFixed(2);
+        const noteInfo = frequencyToNoteAndOctave(frequency);
+        const noteString = noteInfo.name ? `${noteInfo.name}${noteInfo.octave}` : '-';
+        noteDisplay.textContent = noteString;
+        
+        if (noteInfo.name) {
+            handleNoteChange({
+                note: noteInfo.name,
+                octave: noteInfo.octave,
+                frequency: frequency,
+                midiNote: noteToMidi(noteInfo.name, noteInfo.octave)
+            });
         } else {
-            frequencyDisplay.textContent = '-';
-            noteDisplay.textContent = '-';
+            handleNoteChange(null);
         }
     } else {
+        handleNoteChange(null);
         frequencyDisplay.textContent = '-';
         noteDisplay.textContent = '-';
     }
+}
 
-    // Logic for recording notes for sheet music
-    // Compare currentDetectedNote ({name, octave} or null) with lastDetectedNoteInfo ({name, octave} or null)
-    const notesAreDifferent = 
-        (!currentDetectedNote && lastDetectedNoteInfo) || // Note stopped
-        (currentDetectedNote && !lastDetectedNoteInfo) || // Note started
-        (currentDetectedNote && lastDetectedNoteInfo && // Note changed
-         (currentDetectedNote.name !== lastDetectedNoteInfo.name || currentDetectedNote.octave !== lastDetectedNoteInfo.octave));
+function detectPitchAutocorrelation(buffer, sampleRate) {
+    const SIZE = buffer.length;
+    const sumOfSquares = buffer.reduce((sum, val) => sum + val * val, 0);
+    
+    if (sumOfSquares < 0.001) return null; // Too quiet
+    
+    let bestOffset = -1;
+    let bestCorrelation = 0;
+    let rms = Math.sqrt(sumOfSquares / SIZE);
+    
+    if (rms < 0.01) return null; // Below noise threshold
+    
+    let lastCorrelation = 1;
+    for (let offset = 10; offset < SIZE / 2; offset++) {
+        let correlation = 0;
+        
+        for (let i = 0; i < SIZE - offset; i++) {
+            correlation += Math.abs(buffer[i] - buffer[i + offset]);
+        }
+        correlation = 1 - (correlation / (SIZE - offset));
+        
+        if (correlation > 0.9 && correlation > lastCorrelation) {
+            bestCorrelation = correlation;
+            bestOffset = offset;
+        } else if (correlation > 0.9 && bestCorrelation > 0.9) {
+            break; // Found a good peak, stop looking
+        }
+        lastCorrelation = correlation;
+    }
+    
+    if (bestCorrelation > 0.9 && bestOffset !== -1) {
+        return sampleRate / bestOffset;
+    }
+    
+    return null;
+}
 
-    if (notesAreDifferent) {
-        // If a previous note was sounding and it has now changed or stopped
-        if (lastDetectedNoteInfo && lastDetectedNoteInfo.name) {
-            const duration = currentTime - currentNoteStartTime;
-            if (duration >= MIN_NOTE_DURATION_THRESHOLD) {
-                recordedSheetMusic.push({
-                    pitch: lastDetectedNoteInfo.name,
-                    octave: lastDetectedNoteInfo.octave,
-                    startTime: parseFloat(currentNoteStartTime.toFixed(3)),
-                    duration: parseFloat(duration.toFixed(3))
+function handleNoteChange(currentNote) {
+    const now = Date.now();
+    const currentNoteString = currentNote ? `${currentNote.note}${currentNote.octave}` : null;
+    const lastNoteString = lastDetectedNote ? `${lastDetectedNote.note}${lastDetectedNote.octave}` : null;
+    
+    if (currentNoteString !== lastNoteString) {
+        // Note changed or stopped
+        if (lastDetectedNote && noteStartTime) {
+            const noteDuration = now - noteStartTime;
+            if (noteDuration >= NOTE_DURATION_THRESHOLD) {
+                recordedNotes.push({
+                    ...lastDetectedNote,
+                    duration: noteDuration,
+                    startTime: noteStartTime - recordingStartTime
                 });
+                noteCountDisplay.textContent = recordedNotes.length.toString();
             }
         }
-
-        // If a new note is starting now
-        if (currentDetectedNote && currentDetectedNote.name) {
-            currentNoteStartTime = currentTime; // Mark the start time of this new note segment
-        }
-        // Update lastDetectedNoteInfo for the next frame
-        lastDetectedNoteInfo = currentDetectedNote;
+        
+        lastDetectedNote = currentNote;
+        noteStartTime = currentNote ? now : null;
     }
+}
+
+function noteToMidi(noteName, octave) {
+    const noteIndex = NOTE_NAMES.indexOf(noteName);
+    return noteIndex + (octave + 1) * 12;
 }
 
 function frequencyToNoteAndOctave(frequency) {
@@ -307,18 +299,99 @@ function frequencyToNoteAndOctave(frequency) {
     };
 }
 
-function generateSheetMusicJSON() {
-    const sheetMusicData = {
-        title: "Recorded Melody",
-        timeSignature: "4/4", // Placeholder, could be made configurable
-        tempo: 120, // Placeholder, actual tempo is implicit in note timings
-        notes: recordedSheetMusic
-    };
-    return JSON.stringify(sheetMusicData, null, 2); // Pretty print with 2 spaces
+function downloadMidiFile() {
+    if (recordedNotes.length === 0) return;
+    
+    const midiData = createMidiFile(recordedNotes);
+    const blob = new Blob([midiData], { type: 'audio/midi' });
+    const url = URL.createObjectURL(blob);
+    
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `recorded_notes_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.mid`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+function createMidiFile(notes) {
+    // Simple MIDI file creation
+    const ticksPerQuarter = 480;
+    const tempo = 500000; // 120 BPM
+    
+    // MIDI header
+    const header = new Uint8Array([
+        0x4D, 0x54, 0x68, 0x64, // "MThd"
+        0x00, 0x00, 0x00, 0x06, // Header length
+        0x00, 0x00, // Format 0
+        0x00, 0x01, // 1 track
+        0x01, 0xE0  // Ticks per quarter note (480)
+    ]);
+    
+    // Track events
+    let trackData = [];
+    
+    // Add tempo event
+    trackData.push(...[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 120 BPM
+    
+    let lastTime = 0;
+    
+    for (const note of notes) {
+        const startTicks = Math.round((note.startTime * ticksPerQuarter) / 500); // Convert ms to ticks
+        const durationTicks = Math.round((note.duration * ticksPerQuarter) / 500);
+        
+        const deltaTimeStart = startTicks - lastTime;
+        const deltaTimeEnd = durationTicks;
+        
+        // Note on
+        trackData.push(...encodeVariableLength(deltaTimeStart));
+        trackData.push(0x90, note.midiNote, 64); // Note on, velocity 64
+        
+        // Note off
+        trackData.push(...encodeVariableLength(deltaTimeEnd));
+        trackData.push(0x80, note.midiNote, 0); // Note off
+        
+        lastTime = startTicks + durationTicks;
+    }
+    
+    // End of track
+    trackData.push(0x00, 0xFF, 0x2F, 0x00);
+    
+    // Track header
+    const trackHeader = new Uint8Array([
+        0x4D, 0x54, 0x72, 0x6B, // "MTrk"
+        ...intToBytes(trackData.length, 4) // Track length
+    ]);
+    
+    // Combine all data
+    const midiFile = new Uint8Array(header.length + trackHeader.length + trackData.length);
+    midiFile.set(header, 0);
+    midiFile.set(trackHeader, header.length);
+    midiFile.set(trackData, header.length + trackHeader.length);
+    
+    return midiFile;
+}
+
+function encodeVariableLength(value) {
+    const bytes = [];
+    bytes.unshift(value & 0x7F);
+    value >>= 7;
+    while (value) {
+        bytes.unshift((value & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    return bytes;
+}
+
+function intToBytes(value, byteCount) {
+    const bytes = [];
+    for (let i = byteCount - 1; i >= 0; i--) {
+        bytes.push((value >> (8 * i)) & 0xFF);
+    }
+    return bytes;
 }
 
 // Initial UI setup
 statusDisplay.textContent = 'Status: Idle';
 statusDisplay.className = 'status-idle';
-sheetMusicOutputContainer.style.display = 'none'; // Hide JSON output area initially
-downloadJsonButton.disabled = true; // Disable download button initially
