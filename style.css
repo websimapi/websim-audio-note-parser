@@ -95,3 +95,62 @@ button.recording:hover {
 .status-recording { color: #198754; } /* Bootstrap success green */
 .status-error { color: #dc3545; } /* Bootstrap danger red */
 
+/* Styles for Sheet Music Output */
+#sheetMusicOutputContainer {
+    margin-top: 25px;
+    padding: 15px 30px; /* Match main container padding */
+    background-color: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 12px; /* Match main container radius */
+    text-align: left;
+    display: none; /* Initially hidden */
+    max-width: 500px; /* Match main container */
+    width: 100%;
+    box-sizing: border-box; /* Ensure padding is included in width */
+}
+
+#sheetMusicOutputContainer h2 {
+    margin-top: 0;
+    margin-bottom: 10px;
+    font-size: 1.3em;
+    color: #007bff; /* Match main heading color */
+}
+
+#sheetMusicJson {
+    width: 100%; /* Take full width of parent */
+    height: 150px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+    font-size: 0.85em;
+    border: 1px solid #ced4da;
+    border-radius: 4px;
+    padding: 10px;
+    box-sizing: border-box; /* Ensure padding doesn't expand it */
+    resize: vertical;
+    margin-bottom: 10px; /* Space before button */
+}
+
+#downloadJsonButton {
+    background-color: #28a745; /* Green */
+    color: white;
+    border: none;
+    padding: 10px 20px; /* Slightly smaller than main button */
+    font-size: 0.9em;
+    font-weight: bold;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.3s ease, transform 0.1s ease;
+}
+
+#downloadJsonButton:hover {
+    background-color: #218838;
+}
+
+#downloadJsonButton:active {
+    transform: scale(0.98);
+}
+
+#downloadJsonButton:disabled {
+    background-color: #6c757d;
+    cursor: not-allowed;
+    transform: none; /* Prevent active transform when disabled */
+}
