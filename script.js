@@ -253,11 +253,13 @@ function handleNoteChange(currentNote) {
         if (lastDetectedNote && noteStartTime) {
             const noteDuration = now - noteStartTime;
             if (noteDuration >= NOTE_DURATION_THRESHOLD) {
-                recordedNotes.push({
+                const recordedNote = {
                     ...lastDetectedNote,
                     duration: noteDuration,
                     startTime: noteStartTime - recordingStartTime
-                });
+                };
+                recordedNotes.push(recordedNote);
+                console.log('Recorded note:', recordedNote);
                 noteCountDisplay.textContent = recordedNotes.length.toString();
             }
         }
@@ -302,6 +304,7 @@ function frequencyToNoteAndOctave(frequency) {
 function downloadMidiFile() {
     if (recordedNotes.length === 0) return;
     
+    console.log('Creating MIDI file with notes:', recordedNotes);
     const midiData = createMidiFile(recordedNotes);
     const blob = new Blob([midiData], { type: 'audio/midi' });
     const url = URL.createObjectURL(blob);
@@ -316,10 +319,11 @@ function downloadMidiFile() {
 }
 
 function createMidiFile(notes) {
+    console.log('Processing notes for MIDI:', notes);
+    
     // Simple MIDI file creation
     const ticksPerQuarter = 480;
-    const bpm = 120;
-    const tempo = 500000; // 120 BPM in microseconds per quarter note
+    const microsecondsPerQuarter = 500000; // 120 BPM
     
     // MIDI header
     const header = new Uint8Array([
@@ -333,31 +337,46 @@ function createMidiFile(notes) {
     // Track events
     let trackData = [];
     
-    // Add tempo event
-    trackData.push(...[0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]); // 120 BPM
+    // Add tempo event at time 0
+    trackData.push(...[0x00, 0xFF, 0x51, 0x03]); // Delta time 0, Meta event, Set Tempo, length 3
+    trackData.push(...[0x07, 0xA1, 0x20]); // 500000 microseconds per quarter note (120 BPM)
     
-    let lastTime = 0;
+    // Sort notes by start time
+    const sortedNotes = [...notes].sort((a, b) => a.startTime - b.startTime);
     
-    for (const note of notes) {
-        // Convert milliseconds to MIDI ticks: ms * ticks_per_quarter * bpm / 60000
-        const startTicks = Math.max(0, Math.round((note.startTime * ticksPerQuarter * bpm) / 60000));
-        const durationTicks = Math.max(1, Math.round((note.duration * ticksPerQuarter * bpm) / 60000));
+    let currentTick = 0;
+    
+    for (let i = 0; i < sortedNotes.length; i++) {
+        const note = sortedNotes[i];
         
-        const deltaTimeStart = Math.max(0, startTicks - lastTime);
+        // Convert milliseconds to ticks: (ms / 1000) * (ticks_per_quarter / (microseconds_per_quarter / 1000000))
+        const startTick = Math.round((note.startTime / 1000) * (ticksPerQuarter / (microsecondsPerQuarter / 1000000)));
+        const durationTicks = Math.max(24, Math.round((note.duration / 1000) * (ticksPerQuarter / (microsecondsPerQuarter / 1000000)))); // Minimum 24 ticks
         
-        // Note on
+        // Calculate delta time from current position to note start
+        const deltaTimeStart = Math.max(0, startTick - currentTick);
+        
+        console.log(`Note ${i}: ${note.note}${note.octave}, startTime: ${note.startTime}ms, duration: ${note.duration}ms, startTick: ${startTick}, durationTicks: ${durationTicks}, deltaTime: ${deltaTimeStart}`);
+        
+        // Note on event
         trackData.push(...encodeVariableLength(deltaTimeStart));
-        trackData.push(0x90, note.midiNote, 64); // Note on, velocity 64
+        trackData.push(0x90); // Note on, channel 0
+        trackData.push(note.midiNote); // Note number
+        trackData.push(80); // Velocity
         
-        // Note off
+        // Note off event
         trackData.push(...encodeVariableLength(durationTicks));
-        trackData.push(0x80, note.midiNote, 0); // Note off
+        trackData.push(0x80); // Note off, channel 0
+        trackData.push(note.midiNote); // Note number
+        trackData.push(0); // Velocity 0
         
-        lastTime = startTicks + durationTicks;
+        currentTick = startTick + durationTicks;
     }
     
     // End of track
     trackData.push(0x00, 0xFF, 0x2F, 0x00);
+    
+    console.log('Track data length:', trackData.length);
     
     // Track header
     const trackHeader = new Uint8Array([
@@ -371,6 +390,7 @@ function createMidiFile(notes) {
     midiFile.set(trackHeader, header.length);
     midiFile.set(trackData, header.length + trackHeader.length);
     
+    console.log('MIDI file size:', midiFile.length, 'bytes');
     return midiFile;
 }
 
