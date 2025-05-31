@@ -20,6 +20,7 @@ let harmonicAnalyzer = null;
 const toggleRecordingButton = document.getElementById('toggleRecording');
 const downloadMidiButton = document.getElementById('downloadMidi');
 const downloadMp3Button = document.getElementById('downloadMp3');
+const copyJsonButton = document.getElementById('copyJson');
 const playbackButton = document.getElementById('playback');
 const stopPlaybackButton = document.getElementById('stopPlayback');
 const noteDisplay = document.getElementById('noteDisplay');
@@ -30,10 +31,12 @@ const noteCountDisplay = document.getElementById('noteCount');
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 const A4_FREQUENCY = 440;
 const MIN_VALID_FREQUENCY = 80; // Increased minimum frequency
-const MIN_AMPLITUDE_THRESHOLD = 20; // Reduced for better sensitivity
-const NOTE_DURATION_THRESHOLD = 100; // Minimum ms for a note to be recorded
-const HARMONIC_THRESHOLD = 0.3; // Minimum ratio for harmonic detection
-const PEAK_THRESHOLD = 30; // Minimum amplitude for frequency peaks
+const MIN_AMPLITUDE_THRESHOLD = 15; // Further reduced for better sensitivity
+const NOTE_DURATION_THRESHOLD = 80; // Reduced minimum duration
+const HARMONIC_THRESHOLD = 0.15; // More strict harmonic detection
+const PEAK_THRESHOLD = 25; // Reduced for more sensitive peak detection
+const MAX_SIMULTANEOUS_NOTES = 8; // Increased from 4
+const ONSET_THRESHOLD = 0.3; // For onset detection
 
 toggleRecordingButton.addEventListener('click', () => {
     if (!isRecording) {
@@ -45,6 +48,7 @@ toggleRecordingButton.addEventListener('click', () => {
 
 downloadMidiButton.addEventListener('click', downloadMidiFile);
 downloadMp3Button.addEventListener('click', downloadMp3File);
+copyJsonButton.addEventListener('click', copyJsonToClipboard);
 playbackButton.addEventListener('click', playRecording);
 stopPlaybackButton.addEventListener('click', stopPlayback);
 
@@ -70,8 +74,8 @@ async function startRecording() {
         sourceNode = audioContext.createMediaStreamSource(mediaStream);
         analyser = audioContext.createAnalyser();
 
-        analyser.fftSize = 16384; // Increased for better frequency resolution
-        analyser.smoothingTimeConstant = 0.3; // Add smoothing
+        analyser.fftSize = 32768; // Increased for even better frequency resolution
+        analyser.smoothingTimeConstant = 0.2; // Reduced smoothing for better onset detection
         const bufferLength = analyser.frequencyBinCount;
         dataArray = new Float32Array(analyser.fftSize);
         frequencyData = new Uint8Array(bufferLength);
@@ -88,6 +92,7 @@ async function startRecording() {
         toggleRecordingButton.classList.add('recording');
         downloadMidiButton.disabled = true;
         downloadMp3Button.disabled = true;
+        copyJsonButton.disabled = true;
         playbackButton.disabled = true;
         statusDisplay.textContent = 'Status: Recording...';
         statusDisplay.className = 'status-recording';
@@ -167,6 +172,7 @@ function stopRecording() {
 
     downloadMidiButton.disabled = recordedNotes.length === 0;
     downloadMp3Button.disabled = recordedNotes.length === 0;
+    copyJsonButton.disabled = recordedNotes.length === 0;
     playbackButton.disabled = recordedNotes.length === 0;
     noteCountDisplay.textContent = recordedNotes.length.toString();
 }
@@ -230,59 +236,136 @@ function detectMultipleFrequencies(frequencyData, sampleRate) {
     const nyquist = sampleRate / 2;
     const binWidth = nyquist / frequencyData.length;
     
-    // Find peaks in frequency spectrum
+    // Advanced peak detection with local maxima and spectral interpolation
     const peaks = [];
-    for (let i = 2; i < frequencyData.length - 2; i++) {
+    const windowSize = 3; // Look at surrounding bins
+    
+    for (let i = windowSize; i < frequencyData.length - windowSize; i++) {
         const current = frequencyData[i];
-        if (current > PEAK_THRESHOLD &&
-            current > frequencyData[i - 1] &&
-            current > frequencyData[i + 1] &&
-            current > frequencyData[i - 2] &&
-            current > frequencyData[i + 2]) {
+        if (current < PEAK_THRESHOLD) continue;
+        
+        // Check if it's a local maximum
+        let isLocalMax = true;
+        let sumNeighbors = 0;
+        let count = 0;
+        
+        for (let j = -windowSize; j <= windowSize; j++) {
+            if (j === 0) continue;
+            const neighborValue = frequencyData[i + j];
+            sumNeighbors += neighborValue;
+            count++;
+            if (neighborValue >= current) {
+                isLocalMax = false;
+            }
+        }
+        
+        if (isLocalMax && current > sumNeighbors / count * 1.2) {
+            // Parabolic interpolation for more accurate frequency
+            const y1 = frequencyData[i - 1];
+            const y2 = frequencyData[i];
+            const y3 = frequencyData[i + 1];
             
-            const frequency = i * binWidth;
-            if (frequency >= MIN_VALID_FREQUENCY && frequency <= 2000) {
-                peaks.push({ frequency, amplitude: current, bin: i });
+            const a = (y1 - 2 * y2 + y3) / 2;
+            const b = (y3 - y1) / 2;
+            
+            let interpolatedBin = i;
+            if (a !== 0) {
+                const offset = -b / (2 * a);
+                if (Math.abs(offset) < 1) {
+                    interpolatedBin = i + offset;
+                }
+            }
+            
+            const frequency = interpolatedBin * binWidth;
+            if (frequency >= MIN_VALID_FREQUENCY && frequency <= 4000) {
+                peaks.push({ 
+                    frequency, 
+                    amplitude: current, 
+                    bin: interpolatedBin,
+                    spectralCentroid: calculateSpectralCentroid(frequencyData, i, windowSize, binWidth)
+                });
             }
         }
     }
     
-    // Sort peaks by amplitude
-    peaks.sort((a, b) => b.amplitude - a.amplitude);
+    // Sort peaks by amplitude and spectral strength
+    peaks.sort((a, b) => (b.amplitude * b.spectralCentroid) - (a.amplitude * a.spectralCentroid));
     
-    // Filter out harmonics and keep only fundamental frequencies
+    // Enhanced harmonic filtering with better fundamental detection
     const fundamentals = [];
+    
     for (const peak of peaks) {
         let isFundamental = true;
+        let harmonicStrength = 0;
         
         // Check if this peak is a harmonic of any existing fundamental
         for (const fund of fundamentals) {
             const ratio = peak.frequency / fund.frequency;
-            if (Math.abs(ratio - Math.round(ratio)) < 0.05 && ratio >= 2) {
-                isFundamental = false;
-                break;
+            const nearestHarmonic = Math.round(ratio);
+            
+            if (nearestHarmonic >= 2 && Math.abs(ratio - nearestHarmonic) < HARMONIC_THRESHOLD) {
+                // Check harmonic strength
+                const expectedAmplitude = fund.amplitude / (nearestHarmonic * nearestHarmonic);
+                const amplitudeRatio = peak.amplitude / expectedAmplitude;
+                
+                if (amplitudeRatio > 0.3 && amplitudeRatio < 3) {
+                    isFundamental = false;
+                    harmonicStrength = amplitudeRatio;
+                    break;
+                }
             }
         }
         
-        // Check if any existing fundamental is a harmonic of this peak
+        // Check if existing fundamentals might be harmonics of this peak
         if (isFundamental) {
-            fundamentals.forEach((fund, index) => {
+            for (let j = fundamentals.length - 1; j >= 0; j--) {
+                const fund = fundamentals[j];
                 const ratio = fund.frequency / peak.frequency;
-                if (Math.abs(ratio - Math.round(ratio)) < 0.05 && ratio >= 2) {
-                    fundamentals[index] = peak; // Replace with lower fundamental
+                const nearestHarmonic = Math.round(ratio);
+                
+                if (nearestHarmonic >= 2 && Math.abs(ratio - nearestHarmonic) < HARMONIC_THRESHOLD) {
+                    const expectedAmplitude = peak.amplitude / (nearestHarmonic * nearestHarmonic);
+                    const amplitudeRatio = fund.amplitude / expectedAmplitude;
+                    
+                    if (amplitudeRatio > 0.3 && amplitudeRatio < 3) {
+                        // Remove the harmonic and keep this as fundamental
+                        fundamentals.splice(j, 1);
+                    }
                 }
-            });
+            }
         }
         
         if (isFundamental) {
             fundamentals.push(peak);
         }
         
-        // Limit to top 4 simultaneous notes for performance
-        if (fundamentals.length >= 4) break;
+        // Limit simultaneous notes but allow more for better polyphony
+        if (fundamentals.length >= MAX_SIMULTANEOUS_NOTES) break;
+    }
+    
+    // Additional filtering: remove very weak fundamentals if we have many
+    if (fundamentals.length > 4) {
+        const maxAmplitude = Math.max(...fundamentals.map(f => f.amplitude));
+        fundamentals.filter(f => f.amplitude > maxAmplitude * 0.15);
     }
     
     return fundamentals.map(peak => peak.frequency);
+}
+
+function calculateSpectralCentroid(frequencyData, centerBin, windowSize, binWidth) {
+    let weightedSum = 0;
+    let magnitudeSum = 0;
+    
+    for (let i = centerBin - windowSize; i <= centerBin + windowSize; i++) {
+        if (i >= 0 && i < frequencyData.length) {
+            const frequency = i * binWidth;
+            const magnitude = frequencyData[i];
+            weightedSum += frequency * magnitude;
+            magnitudeSum += magnitude;
+        }
+    }
+    
+    return magnitudeSum > 0 ? weightedSum / magnitudeSum : 0;
 }
 
 function handleNotesChange(currentNotes) {
@@ -650,6 +733,46 @@ function stopPlayback() {
         playbackContext.close().catch(e => console.error('Error closing playback context:', e));
         playbackContext = null;
     }
+}
+
+function copyJsonToClipboard() {
+    if (recordedNotes.length === 0) return;
+    
+    const jsonData = {
+        recordingInfo: {
+            noteCount: recordedNotes.length,
+            totalDuration: Math.max(...recordedNotes.map(note => note.startTime + note.duration)),
+            recordingDate: new Date().toISOString()
+        },
+        notes: recordedNotes.map(note => ({
+            name: note.name,
+            octave: note.octave,
+            frequency: Math.round(note.frequency * 100) / 100,
+            midiNote: note.midiNote,
+            startTime: note.startTime,
+            duration: note.duration,
+            startTimeSeconds: Math.round(note.startTime / 10) / 100,
+            durationSeconds: Math.round(note.duration / 10) / 100
+        }))
+    };
+    
+    navigator.clipboard.writeText(JSON.stringify(jsonData, null, 2))
+        .then(() => {
+            // Temporarily change button text to show success
+            const originalText = copyJsonButton.textContent;
+            copyJsonButton.textContent = 'Copied!';
+            copyJsonButton.style.backgroundColor = '#28a745';
+            
+            setTimeout(() => {
+                copyJsonButton.textContent = originalText;
+                copyJsonButton.style.backgroundColor = '';
+            }, 2000);
+        })
+        .catch(err => {
+            console.error('Failed to copy to clipboard:', err);
+            // Fallback: show the JSON in an alert
+            alert('Copy failed. Here is the JSON data:\n\n' + JSON.stringify(jsonData, null, 2));
+        });
 }
 
 // Initial UI setup
